@@ -37,6 +37,7 @@ SURFACE_ENTRANCE_WP_SEQ = 4
 AUTO_PATH_START_WP_SEQ = 5
 AUTO_PATH_END_WP_SEQ = 16
 EXIT_CORRIDOR_WP_SEQ = 16
+EXIT_CORRIDOR_END_WP_SEQ = 17
 
 # 40 x 30 m delivery surface in local coordinates.
 # x axis = 40 m side, y axis = 30 m side.

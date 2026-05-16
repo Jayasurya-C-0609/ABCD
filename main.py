@@ -10,6 +10,7 @@ from config import (
     CORRIDOR_ENTRANCE_WP_SEQ,
     CRUISE_SPEED_MPS,
     DROIDCAM_URL,
+    EXIT_CORRIDOR_END_WP_SEQ,
     EXIT_CORRIDOR_WP_SEQ,
     EXIT_CORRIDOR_ALT_M,
     PAYLOAD_DESCENT_ALT_M,
@@ -531,74 +532,33 @@ def run_post_target_sequence(controller, cap, mission_items):
         return status
     print("Reached waypoint 16")
 
-    set_mission_state("GOTO_WP3")
-    status, _ = goto_waypoint(
-        controller,
-        cap,
-        waypoint_with_altitude(mission_items[CORRIDOR_ENTRANCE_WP_SEQ], RETURN_ALT_M),
-        "Corridor WP3 at 10m",
-        watch_for_qr=False,
-    )
-    if status in ("quit", "camera_failed"):
-        return status
-    print("Reached waypoint 3")
-
-    set_mission_state("DESCEND_FOR_CORRIDOR")
-    print("Corridor altitude active: descending to 2-3m")
+    set_mission_state("DESCEND_FOR_EXIT_CORRIDOR")
+    print("Exit corridor altitude active: descending to 2-3m at waypoint 16")
     status, corridor_low_point = change_altitude_at_current_xy(
         controller,
         cap,
         EXIT_CORRIDOR_ALT_M,
-        "Corridor WP3 descent to 3m",
+        "Exit Corridor WP16 descent to 3m",
     )
     if status != "reached":
         return status
 
-    set_mission_state("MOVE_WP3_TO_WP4")
-    print("Corridor altitude active: moving WP3 to WP4 at 2-3m")
+    set_mission_state("MOVE_WP16_TO_WP17")
+    print("Exit corridor altitude active: moving WP16 to WP17 at 2-3m")
     status, _ = goto_waypoint(
         controller,
         cap,
-        waypoint_with_altitude(mission_items[SURFACE_ENTRANCE_WP_SEQ], EXIT_CORRIDOR_ALT_M),
-        "Surface Entrance WP4 at 3m",
+        waypoint_with_altitude(mission_items[EXIT_CORRIDOR_END_WP_SEQ], EXIT_CORRIDOR_ALT_M),
+        "Exit Corridor WP17 at 3m",
         watch_for_qr=False,
     )
     if status in ("quit", "camera_failed"):
         return status
-    print("Reached waypoint 4")
+    print("Reached waypoint 17")
 
-    set_mission_state("ASCEND_AFTER_WP4")
-    print("Ascending back to 10m")
-    status, _ = goto_waypoint(
-        controller,
-        cap,
-        waypoint_with_altitude(mission_items[SURFACE_ENTRANCE_WP_SEQ], RETURN_ALT_M),
-        "Surface Entrance WP4 at 10m",
-        watch_for_qr=False,
-        arrival_tolerance_m=0.8,
-    )
-    if status in ("quit", "camera_failed"):
-        return status
-
-    remaining_return_waypoints = [
-        mission_items[seq]
-        for seq in sorted(mission_items)
-        if seq > EXIT_CORRIDOR_WP_SEQ
-    ]
-
-    if remaining_return_waypoints:
-        set_mission_state("RETURN_PATH_AFTER_WP4")
-
-        for waypoint in remaining_return_waypoints:
-            status, _ = goto_waypoint(
-                controller,
-                cap,
-                waypoint_with_altitude(waypoint, RETURN_ALT_M),
-                f"Return WP{waypoint['seq']} at 10m",
-                watch_for_qr=False,
-            )
-            if status in ("quit", "camera_failed"):
-                return status
+    set_mission_state("RTL")
+    print("Waypoint 17 reached, switching to RTL")
+    controller.set_mode("RTL")
 
     print("Post-target mission sequence complete")
     return "complete"
@@ -619,6 +579,7 @@ def main():
             CORRIDOR_ENTRANCE_WP_SEQ,
             SURFACE_ENTRANCE_WP_SEQ,
             EXIT_CORRIDOR_WP_SEQ,
+            EXIT_CORRIDOR_END_WP_SEQ,
         ]
         missing_wps = [seq for seq in required_wps if seq not in mission_items]
         if missing_wps:
