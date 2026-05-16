@@ -22,8 +22,12 @@ DROIDCAM_URL = ""
 TAKEOFF_ALT_M = 5.0
 START_QR_ALT_M = 5.0
 SEARCH_ALT_M = 10.0
-CRUISE_SPEED_MPS = 1.5
-POSITION_TOLERANCE_M = 1.0
+CRUISE_SPEED_MPS = 0.8
+POSITION_TOLERANCE_M = 3.0
+PAYLOAD_DESCENT_ALT_M = 5.0
+PAYLOAD_HOVER_TIME_S = 7.0
+EXIT_CORRIDOR_ALT_M = 3.0
+RETURN_ALT_M = 10.0
 
 # Mission Planner waypoint sequence numbers.
 # These must match the green waypoint numbers shown in Mission Planner.
@@ -31,8 +35,8 @@ START_QR_WP_SEQ = 2
 CORRIDOR_ENTRANCE_WP_SEQ = 3
 SURFACE_ENTRANCE_WP_SEQ = 4
 AUTO_PATH_START_WP_SEQ = 5
-AUTO_PATH_END_WP_SEQ = 17
-EXIT_CORRIDOR_WP_SEQ = 17
+AUTO_PATH_END_WP_SEQ = 16
+EXIT_CORRIDOR_WP_SEQ = 16
 
 # 40 x 30 m delivery surface in local coordinates.
 # x axis = 40 m side, y axis = 30 m side.

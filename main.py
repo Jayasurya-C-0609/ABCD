@@ -8,9 +8,14 @@ from config import (
     CAMERA_SOURCE,
     CONNECTION_STRING,
     CORRIDOR_ENTRANCE_WP_SEQ,
+    CRUISE_SPEED_MPS,
     DROIDCAM_URL,
     EXIT_CORRIDOR_WP_SEQ,
+    EXIT_CORRIDOR_ALT_M,
+    PAYLOAD_DESCENT_ALT_M,
+    PAYLOAD_HOVER_TIME_S,
     POSITION_TOLERANCE_M,
+    RETURN_ALT_M,
     START_QR_WP_SEQ,
     SURFACE_ENTRANCE_WP_SEQ,
     TAKEOFF_ALT_M,
@@ -20,17 +25,36 @@ from mavlink.guided_control import GuidedController
 from vision.camera import open_camera
 
 
-CENTER_THRESHOLD_PX = 40
-ALIGN_SPEED_MPS = 0.25
 DECODE_ATTEMPTS = 5
-ALIGN_TIMEOUT_S = 5.0
 WAYPOINT_TIMEOUT_S = 60
 START_QR_TIMEOUT_S = 45
 DETECTION_INTERVAL_S = 0.8
 WRONG_QR_SUPPRESS_S = 12.0
+LOOP_SLEEP_S = 0.02
+ALTITUDE_TOLERANCE_M = 0.3
+POSITION_RETRY_TIMEOUT_S = 3.0
 WINDOW_NAME = "SkyScan QR Mission"
 _detect_qrs = None
 _decode_qr_crop = None
+_last_frame_time = None
+_display_fps = 0.0
+
+
+def set_mission_state(state_name):
+    print(f"\n=== STATE: {state_name} ===")
+
+
+def waypoint_with_altitude(waypoint, altitude_m):
+    updated = dict(waypoint)
+    updated["alt"] = altitude_m
+    return updated
+
+
+def target_text_matches(decoded_text, target_value):
+    if decoded_text is None or target_value is None:
+        return False
+
+    return decoded_text.strip().casefold() == target_value.strip().casefold()
 
 
 def load_yolo_detector():
@@ -74,35 +98,6 @@ def clamp(value, min_value, max_value):
     return max(min_value, min(max_value, value))
 
 
-def qr_alignment_velocity(frame, bbox):
-    h, w = frame.shape[:2]
-    x1, y1, x2, y2 = bbox
-
-    qr_cx = (x1 + x2) / 2
-    qr_cy = (y1 + y2) / 2
-    img_cx = w / 2
-    img_cy = h / 2
-
-    err_x = qr_cx - img_cx
-    err_y = qr_cy - img_cy
-
-    vx = 0.0
-    vy = 0.0
-
-    if err_x > CENTER_THRESHOLD_PX:
-        vy = ALIGN_SPEED_MPS
-    elif err_x < -CENTER_THRESHOLD_PX:
-        vy = -ALIGN_SPEED_MPS
-
-    if err_y < -CENTER_THRESHOLD_PX:
-        vx = ALIGN_SPEED_MPS
-    elif err_y > CENTER_THRESHOLD_PX:
-        vx = -ALIGN_SPEED_MPS
-
-    centered = abs(err_x) < CENTER_THRESHOLD_PX and abs(err_y) < CENTER_THRESHOLD_PX
-    return vx, vy, centered, err_x, err_y
-
-
 def read_camera_frame(cap):
     ret, frame = cap.read()
 
@@ -114,6 +109,14 @@ def read_camera_frame(cap):
 
 
 def show_frame(frame, status):
+    global _last_frame_time, _display_fps
+
+    now = time.time()
+    if _last_frame_time is not None:
+        instant_fps = 1.0 / max(now - _last_frame_time, 0.001)
+        _display_fps = (_display_fps * 0.85) + (instant_fps * 0.15)
+    _last_frame_time = now
+
     cv2.putText(
         frame,
         status,
@@ -121,6 +124,15 @@ def show_frame(frame, status):
         cv2.FONT_HERSHEY_SIMPLEX,
         0.8,
         (0, 255, 255),
+        2,
+    )
+    cv2.putText(
+        frame,
+        f"FPS: {_display_fps:.1f}",
+        (20, 75),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.75,
+        (0, 255, 0),
         2,
     )
     cv2.imshow(WINDOW_NAME, frame)
@@ -142,89 +154,37 @@ def draw_detection(frame, detection, label="QR"):
 
 
 def align_and_decode_qr(controller, cap, reason):
-    print(f"{reason}: QR detected, aligning with center")
-    last_velocity_time = 0
-    centered_since = None
-    best_bbox = None
-    align_started_at = time.time()
-    decode_frame = None
+    print(f"{reason}: QR detected, stopping and decoding without center alignment")
+    controller.stop()
 
-    while True:
+    for attempt in range(1, DECODE_ATTEMPTS + 1):
         frame = read_camera_frame(cap)
         if frame is None:
             return None
 
         detections = detect_qrs(frame)
-
         if not detections:
-            controller.stop()
-            centered_since = None
+            print(f"{reason}: no QR visible on decode attempt {attempt}")
             key = show_frame(frame, f"{reason}: waiting for QR")
             if key == ord("q"):
                 return None
+            time.sleep(0.2)
             continue
 
-        detection = max(detections, key=lambda det: det["confidence"])
-        best_bbox = detection["bbox"]
-        decode_frame = frame.copy()
-        draw_detection(frame, detection, "ALIGN")
+        print(f"{reason}: decode attempt {attempt}, QR detections = {len(detections)}")
 
-        vx, vy, centered, err_x, err_y = qr_alignment_velocity(frame, best_bbox)
-        cv2.putText(
-            frame,
-            f"err_x={err_x:.0f}, err_y={err_y:.0f}",
-            (20, 75),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 0),
-            2,
-        )
+        for index, detection in enumerate(detections, start=1):
+            draw_detection(frame, detection, f"QR {index}")
+            decoded_text, processed = decode_qr_crop(frame, detection["bbox"])
 
-        if centered:
-            controller.stop()
-            if centered_since is None:
-                centered_since = time.time()
-            if time.time() - centered_since > 0.7:
-                break
-        else:
-            centered_since = None
-            if time.time() - last_velocity_time > 0.15:
-                controller.send_body_velocity(vx, vy, 0)
-                last_velocity_time = time.time()
+            if processed is not None:
+                cv2.imshow("Processed QR", processed)
 
-        if time.time() - align_started_at > ALIGN_TIMEOUT_S and best_bbox is not None:
-            controller.stop()
-            print(f"{reason}: alignment timeout, trying decode from visible QR")
-            break
+            print(f"{reason}: QR {index} decoded = {decoded_text}")
+            if decoded_text:
+                show_frame(frame, f"{reason}: decoded {decoded_text}")
+                return decoded_text.strip()
 
-        key = show_frame(frame, f"{reason}: aligning QR")
-        if key == ord("q"):
-            controller.stop()
-            return None
-
-    controller.stop()
-    print(f"{reason}: decoding QR")
-
-    for attempt in range(1, DECODE_ATTEMPTS + 1):
-        frame = decode_frame if attempt == 1 and decode_frame is not None else read_camera_frame(cap)
-        if frame is None:
-            return None
-
-        fresh_detections = detect_qrs(frame)
-        if fresh_detections:
-            best_bbox = max(fresh_detections, key=lambda det: det["confidence"])["bbox"]
-
-        decoded_text, processed = decode_qr_crop(frame, best_bbox)
-
-        if processed is not None:
-            cv2.imshow("Processed QR", processed)
-
-        if decoded_text:
-            print(f"{reason}: decoded QR = {decoded_text}")
-            show_frame(frame, f"{reason}: decoded {decoded_text}")
-            return decoded_text.strip()
-
-        print(f"{reason}: decode attempt {attempt} failed")
         show_frame(frame, f"{reason}: decode attempt {attempt}")
         time.sleep(0.3)
 
@@ -232,7 +192,153 @@ def align_and_decode_qr(controller, cap, reason):
     return None
 
 
-def goto_waypoint(controller, cap, waypoint, label, watch_for_qr=False, target_value=None):
+def hover_with_camera(controller, cap, hover_time_s, label, hold_waypoint=None):
+    print(f"{label}: hovering for {hover_time_s:.1f}s")
+    end_time = time.time() + hover_time_s
+
+    while time.time() < end_time:
+        remaining_s = max(0.0, end_time - time.time())
+        print(f"{label}: hover timer {remaining_s:.1f}s remaining")
+        if hold_waypoint is None:
+            controller.stop()
+        else:
+            command_position_hold(controller, hold_waypoint)
+
+        frame = read_camera_frame(cap)
+        if frame is not None:
+            key = show_frame(frame, label)
+            if key == ord("q"):
+                return "quit"
+        time.sleep(0.2)
+
+    return "done"
+
+
+def get_latest_global_position(controller, timeout_s=0.2):
+    msg = controller.master.recv_match(
+        type="GLOBAL_POSITION_INT",
+        blocking=True,
+        timeout=timeout_s,
+    )
+
+    if msg is None:
+        return None
+
+    return {
+        "type": "global",
+        "source": "latest GLOBAL_POSITION_INT",
+        "lat": msg.lat / 1e7,
+        "lon": msg.lon / 1e7,
+        "alt": msg.relative_alt / 1000.0,
+    }
+
+
+def get_safe_current_position(controller):
+    end_time = time.time() + POSITION_RETRY_TIMEOUT_S
+
+    while time.time() < end_time:
+        position = controller.get_global_position(timeout_s=0.4)
+        if position is not None:
+            safe_position = {
+                "type": "global",
+                "source": "controller.get_global_position",
+                "lat": position["lat"],
+                "lon": position["lon"],
+                "alt": position["relative_alt"],
+            }
+            print(f"Current position source used: {safe_position['source']}")
+            return safe_position
+
+        position = get_latest_global_position(controller, timeout_s=0.2)
+        if position is not None:
+            print(f"Current position source used: {position['source']}")
+            return position
+
+        local_position = controller.get_local_position(timeout_s=0.2)
+        if local_position is not None:
+            north, east, down = local_position
+            safe_position = {
+                "type": "local",
+                "source": "LOCAL_POSITION_NED",
+                "north": north,
+                "east": east,
+                "alt": -down,
+            }
+            print(f"Current position source used: {safe_position['source']}")
+            return safe_position
+
+        print("Current position unavailable, holding and retrying...")
+        controller.stop()
+        time.sleep(0.2)
+
+    print("Current position unavailable after retry")
+    return None
+
+
+def command_position_hold(controller, position):
+    if position["type"] == "global":
+        controller.goto_global_location(position["lat"], position["lon"], position["alt"])
+    else:
+        controller.goto_local_position(position["north"], position["east"], position["alt"])
+
+
+def get_current_altitude(controller):
+    position = controller.get_global_position(timeout_s=0.05)
+    if position is not None:
+        return position["relative_alt"], "GLOBAL_POSITION_INT"
+
+    local_position = controller.get_local_position(timeout_s=0.05)
+    if local_position is not None:
+        return -local_position[2], "LOCAL_POSITION_NED"
+
+    return None, None
+
+
+def change_altitude_at_current_xy(controller, cap, target_alt_m, label):
+    current_position = get_safe_current_position(controller)
+    if current_position is None:
+        return "position_failed", None
+
+    target_position = dict(current_position)
+    target_position["alt"] = target_alt_m
+
+    started_at = time.time()
+    while time.time() - started_at < WAYPOINT_TIMEOUT_S:
+        command_position_hold(controller, target_position)
+        current_alt, altitude_source = get_current_altitude(controller)
+
+        if current_alt is not None:
+            print(
+                f"{label}: current_alt={current_alt:.2f}m, "
+                f"target_alt={target_alt_m:.2f}m, source={altitude_source}"
+            )
+            if abs(current_alt - target_alt_m) <= ALTITUDE_TOLERANCE_M:
+                print(f"{label}: reached target altitude {target_alt_m:.2f}m")
+                return "reached", target_position
+        else:
+            print(f"{label}: altitude unavailable while changing altitude")
+
+        frame = read_camera_frame(cap)
+        if frame is not None:
+            key = show_frame(frame, label)
+            if key == ord("q"):
+                return "quit", target_position
+
+        time.sleep(0.1)
+
+    print(f"{label}: altitude change timeout")
+    return "timeout", target_position
+
+
+def goto_waypoint(
+    controller,
+    cap,
+    waypoint,
+    label,
+    watch_for_qr=False,
+    target_value=None,
+    arrival_tolerance_m=None,
+):
     print(
         f"Moving to {label}: "
         f"Lat={waypoint['lat']:.7f}, Lon={waypoint['lon']:.7f}, Alt={waypoint['alt']:.1f}"
@@ -242,6 +348,7 @@ def goto_waypoint(controller, cap, waypoint, label, watch_for_qr=False, target_v
     last_detection_time = 0
     suppress_qr_until = 0
     detections = []
+    arrival_tolerance_m = arrival_tolerance_m or POSITION_TOLERANCE_M
 
     while time.time() - started_at < WAYPOINT_TIMEOUT_S:
         controller.goto_global_location(
@@ -273,7 +380,9 @@ def goto_waypoint(controller, cap, waypoint, label, watch_for_qr=False, target_v
 
             if decoded_text is None:
                 print(f"{label}: could not decode, resuming path")
-            elif decoded_text == target_value:
+            elif target_text_matches(decoded_text, target_value):
+                controller.stop()
+                print(f"Correct QR detected: {decoded_text}")
                 print("TARGET FOUND")
                 return "target_found", decoded_text
             else:
@@ -291,7 +400,7 @@ def goto_waypoint(controller, cap, waypoint, label, watch_for_qr=False, target_v
             waypoint["alt"],
         )
 
-        if distance is not None and distance <= POSITION_TOLERANCE_M:
+        if distance is not None and distance <= arrival_tolerance_m:
             print(f"Reached {label}")
             return "reached", None
 
@@ -300,7 +409,7 @@ def goto_waypoint(controller, cap, waypoint, label, watch_for_qr=False, target_v
             controller.stop()
             return "quit", None
 
-        time.sleep(0.1)
+        time.sleep(LOOP_SLEEP_S)
 
     print(f"{label}: waypoint timeout, continuing")
     return "timeout", None
@@ -378,6 +487,123 @@ def run_surface_search(controller, cap, target_value, mission_items):
     return None
 
 
+def run_post_target_sequence(controller, cap, mission_items):
+    set_mission_state("TARGET_QR_FOUND")
+    controller.stop()
+    print("Correct QR detected, stopping lawn mower/search motion")
+
+    set_mission_state("DESCEND_TO_5M")
+    print("Descending to 5m")
+    status, payload_point = change_altitude_at_current_xy(
+        controller,
+        cap,
+        PAYLOAD_DESCENT_ALT_M,
+        "Descend to 5m at target QR",
+    )
+    if status != "reached":
+        print(
+            "DESCEND_TO_5M: position/altitude hold failed, "
+            "continuing directly to exit corridor entrance"
+        )
+        payload_point = None
+
+    if payload_point is not None:
+        set_mission_state("HOVER_AFTER_DECODE")
+        status = hover_with_camera(
+            controller,
+            cap,
+            PAYLOAD_HOVER_TIME_S,
+            "Hover after decode at 5m",
+            hold_waypoint=payload_point,
+        )
+        if status == "quit":
+            return status
+
+    set_mission_state("GOTO_EXIT_WP16")
+    status, _ = goto_waypoint(
+        controller,
+        cap,
+        waypoint_with_altitude(mission_items[EXIT_CORRIDOR_WP_SEQ], PAYLOAD_DESCENT_ALT_M),
+        "Exit Corridor WP16 at 5m",
+        watch_for_qr=False,
+    )
+    if status in ("quit", "camera_failed"):
+        return status
+    print("Reached waypoint 16")
+
+    set_mission_state("GOTO_WP3")
+    status, _ = goto_waypoint(
+        controller,
+        cap,
+        waypoint_with_altitude(mission_items[CORRIDOR_ENTRANCE_WP_SEQ], RETURN_ALT_M),
+        "Corridor WP3 at 10m",
+        watch_for_qr=False,
+    )
+    if status in ("quit", "camera_failed"):
+        return status
+    print("Reached waypoint 3")
+
+    set_mission_state("DESCEND_FOR_CORRIDOR")
+    print("Corridor altitude active: descending to 2-3m")
+    status, corridor_low_point = change_altitude_at_current_xy(
+        controller,
+        cap,
+        EXIT_CORRIDOR_ALT_M,
+        "Corridor WP3 descent to 3m",
+    )
+    if status != "reached":
+        return status
+
+    set_mission_state("MOVE_WP3_TO_WP4")
+    print("Corridor altitude active: moving WP3 to WP4 at 2-3m")
+    status, _ = goto_waypoint(
+        controller,
+        cap,
+        waypoint_with_altitude(mission_items[SURFACE_ENTRANCE_WP_SEQ], EXIT_CORRIDOR_ALT_M),
+        "Surface Entrance WP4 at 3m",
+        watch_for_qr=False,
+    )
+    if status in ("quit", "camera_failed"):
+        return status
+    print("Reached waypoint 4")
+
+    set_mission_state("ASCEND_AFTER_WP4")
+    print("Ascending back to 10m")
+    status, _ = goto_waypoint(
+        controller,
+        cap,
+        waypoint_with_altitude(mission_items[SURFACE_ENTRANCE_WP_SEQ], RETURN_ALT_M),
+        "Surface Entrance WP4 at 10m",
+        watch_for_qr=False,
+        arrival_tolerance_m=0.8,
+    )
+    if status in ("quit", "camera_failed"):
+        return status
+
+    remaining_return_waypoints = [
+        mission_items[seq]
+        for seq in sorted(mission_items)
+        if seq > EXIT_CORRIDOR_WP_SEQ
+    ]
+
+    if remaining_return_waypoints:
+        set_mission_state("RETURN_PATH_AFTER_WP4")
+
+        for waypoint in remaining_return_waypoints:
+            status, _ = goto_waypoint(
+                controller,
+                cap,
+                waypoint_with_altitude(waypoint, RETURN_ALT_M),
+                f"Return WP{waypoint['seq']} at 10m",
+                watch_for_qr=False,
+            )
+            if status in ("quit", "camera_failed"):
+                return status
+
+    print("Post-target mission sequence complete")
+    return "complete"
+
+
 def main():
     cap = None
     controller = None
@@ -399,8 +625,10 @@ def main():
             raise RuntimeError(f"Mission is missing waypoint(s): {missing_wps}")
 
         controller.set_mode("GUIDED")
+        controller.set_cruise_speed(CRUISE_SPEED_MPS)
         controller.arm()
         controller.takeoff(TAKEOFF_ALT_M)
+        controller.set_cruise_speed(CRUISE_SPEED_MPS)
 
         print("Opening camera after takeoff")
         cap = open_camera(CAMERA_SOURCE, DROIDCAM_URL)
@@ -439,13 +667,10 @@ def main():
 
         if found_value:
             print(f"TARGET FOUND: {found_value}")
-            print("Moving directly to exit corridor entrance")
-            goto_waypoint(
-                controller,
-                cap,
-                mission_items[EXIT_CORRIDOR_WP_SEQ],
-                "Exit Corridor Entrance",
-            )
+            post_status = run_post_target_sequence(controller, cap, mission_items)
+
+            if post_status != "complete":
+                print(f"Post-target mission ended with status: {post_status}")
         else:
             print("TARGET NOT FOUND")
 

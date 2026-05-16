@@ -42,6 +42,32 @@ class GuidedController:
         print("Takeoff command sent")
         time.sleep(8)
 
+    def set_cruise_speed(self, speed_mps):
+        speed_mps = max(0.1, speed_mps)
+        speed_cmps = speed_mps * 100.0
+
+        self.master.mav.param_set_send(
+            self.master.target_system,
+            self.master.target_component,
+            b"WPNAV_SPEED",
+            speed_cmps,
+            mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+        )
+
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED,
+            0,
+            1,
+            speed_mps,
+            -1,
+            0, 0, 0, 0
+        )
+
+        print(f"Guided cruise speed set to {speed_mps:.2f} m/s")
+        time.sleep(0.5)
+
     def download_mission_items(self, timeout_s=2.0):
         print("Downloading mission waypoints from vehicle...")
         self.master.mav.mission_request_list_send(
@@ -112,7 +138,7 @@ class GuidedController:
         }
 
     def distance_to_global_location(self, lat, lon, alt_m):
-        position = self.get_global_position(timeout_s=0.2)
+        position = self.get_global_position(timeout_s=0.02)
 
         if position is None:
             return None
@@ -160,7 +186,7 @@ class GuidedController:
         return msg.x, msg.y, msg.z
 
     def distance_to_local_position(self, north_m, east_m, alt_m):
-        position = self.get_local_position(timeout_s=0.2)
+        position = self.get_local_position(timeout_s=0.02)
 
         if position is None:
             return None
