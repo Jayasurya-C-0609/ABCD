@@ -12,6 +12,10 @@ acts as if YOLO detected the QR and WeChat decoded it.
 #   ArduPilot SITL TCP:       "tcp:127.0.0.1:5760"
 CONNECTION_STRING = "tcp:127.0.0.1:5763"
 
+# Detection model paths
+QR_MODEL_PATH = "models/QRdet.pt"
+RED_MODEL_PATH = "models/REDdet.pt"
+
 # Camera settings
 # For DroidCam virtual webcam, try CAMERA_SOURCE = 0, 1, or 2.
 # For DroidCam WiFi/IP mode, set DROIDCAM_URL like "http://192.168.1.10:4747/video".
@@ -28,6 +32,12 @@ PAYLOAD_DESCENT_ALT_M = 5.0
 PAYLOAD_HOVER_TIME_S = 7.0
 EXIT_CORRIDOR_ALT_M = 3.0
 RETURN_ALT_M = 10.0
+REDZONE_YOLO_CONF = 0.5
+REDZONE_VISUAL_MIN_AREA_RATIO = 0.08
+REDZONE_VISUAL_CENTER_MARGIN_RATIO = 0.35
+REDZONE_BYPASS_MARGIN_M = 1.5
+REDZONE_SIDE_STEP_SPEED_MPS = 0.4
+REDZONE_SIDE_STEP_TIME_S = 3.0
 
 # Mission Planner waypoint sequence numbers.
 # These must match the green waypoint numbers shown in Mission Planner.
@@ -35,9 +45,17 @@ START_QR_WP_SEQ = 2
 CORRIDOR_ENTRANCE_WP_SEQ = 3
 SURFACE_ENTRANCE_WP_SEQ = 4
 AUTO_PATH_START_WP_SEQ = 5
-AUTO_PATH_END_WP_SEQ = 16
+AUTO_PATH_END_WP_SEQ = 15
 EXIT_CORRIDOR_WP_SEQ = 16
 EXIT_CORRIDOR_END_WP_SEQ = 17
+
+# Fixed red-zone polygon for coordinate-first avoidance.
+REDZONE_POLYGON_LATLON = [
+    (-35.3637350, 149.1652320),
+    (-35.3636950, 149.1652310),
+    (-35.3636940, 149.1653110),
+    (-35.3637330, 149.1653110),
+]
 
 # 40 x 30 m delivery surface in local coordinates.
 # x axis = 40 m side, y axis = 30 m side.

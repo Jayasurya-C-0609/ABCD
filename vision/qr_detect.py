@@ -2,7 +2,7 @@ import cv2
 from ultralytics import YOLO
 
 # Load YOLO model once
-model = YOLO("models/best.pt")
+model = YOLO("models/QRdet.pt")
 
 
 def detect_qrs(frame, conf=0.5):
