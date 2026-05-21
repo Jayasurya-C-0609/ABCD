@@ -8,6 +8,9 @@ from ultralytics import YOLO
 from config import (
     AUTO_PATH_END_WP_SEQ,
     AUTO_PATH_START_WP_SEQ,
+    BYPASS_FORWARD_SPEED,
+    BYPASS_SIDE_SPEED,
+    BYPASS_TURN_HOVER,
     CAMERA_SOURCE,
     CONNECTION_STRING,
     CORRIDOR_ENTRANCE_WP_SEQ,
@@ -29,9 +32,10 @@ from config import (
     REDZONE_VISUAL_MIN_AREA_RATIO,
     REDZONE_YOLO_CONF,
     RETURN_ALT_M,
-    SEARCH_ALT_M,
     START_QR_ALT_M,
     START_QR_WP_SEQ,
+    SURFACE_ALTITUDE_M,
+    SURFACE_SPEED_MPS,
     SURFACE_ENTRANCE_WP_SEQ,
     TAKEOFF_ALT_M,
 )
@@ -41,11 +45,22 @@ from vision.camera import open_camera
 
 
 DECODE_ATTEMPTS = 5
-WAYPOINT_TIMEOUT_S = 60
+WAYPOINT_TIMEOUT = 25
+WAYPOINT_TIMEOUT_S = WAYPOINT_TIMEOUT
+WAYPOINT_ACCEPT_RADIUS = 1.0
 START_QR_TIMEOUT_S = 45
+START_QR_SCAN_TIMEOUT = 60
+START_QR_MAX_RETRIES = 3
+QR_DETECT_FPS = 5
+WP2_SCAN_NUDGE_SPEED_MPS = 0.2
+WP2_SCAN_NUDGE_TIME_S = 1.0
 DETECTION_INTERVAL_S = 0.8
 WRONG_QR_SUPPRESS_S = 12.0
 LOOP_SLEEP_S = 0.02
+WAYPOINT_COMMAND_INTERVAL_S = 1.0
+WAYPOINT_DEBUG_INTERVAL_S = 1.0
+POSITION_STUCK_TIMEOUT_S = 3.0
+POSITION_MOVING_THRESHOLD_M = 0.15
 ALTITUDE_TOLERANCE_M = 0.3
 POSITION_RETRY_TIMEOUT_S = 3.0
 WINDOW_NAME = "SkyScan QR Mission"
@@ -58,6 +73,7 @@ _display_fps = 0.0
 _home_lat = None
 _home_lon = None
 _last_valid_position = None
+_redzone_geometry_logged = False
 
 
 def set_mission_state(state_name):
@@ -260,11 +276,12 @@ def show_frame(frame, status):
 
 
 def draw_detection(frame, detection, label="QR"):
+    detection_type = detection.get("type", "qr")
     x1, y1, x2, y2 = detection["bbox"]
     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
     cv2.putText(
         frame,
-        label,
+        f"{label} {detection_type}",
         (x1, max(25, y1 - 10)),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.6,
@@ -293,23 +310,160 @@ def waypoint_to_xy(waypoint):
     return latlon_to_xy(waypoint["lat"], waypoint["lon"], _home_lat, _home_lon)
 
 
-def make_redzone_box(margin=REDZONE_BYPASS_MARGIN_M):
-    redzone_points_xy = [
+def ground_distance_between_latlon(first_lat, first_lon, second_lat, second_lon):
+    earth_radius_m = 6371000.0
+    lat1 = math.radians(first_lat)
+    lat2 = math.radians(second_lat)
+    dlat = math.radians(second_lat - first_lat)
+    dlon = math.radians(second_lon - first_lon)
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    )
+    return earth_radius_m * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def distance_from_position_to_waypoint(position, waypoint):
+    ground_distance = ground_distance_between_latlon(
+        position["lat"],
+        position["lon"],
+        waypoint["lat"],
+        waypoint["lon"],
+    )
+    altitude_error = waypoint["alt"] - position["alt"]
+    return math.sqrt((ground_distance ** 2) + (altitude_error ** 2))
+
+
+def position_changed_enough(previous_position, current_position):
+    if previous_position is None or current_position is None:
+        return True
+
+    ground_delta = ground_distance_between_latlon(
+        previous_position["lat"],
+        previous_position["lon"],
+        current_position["lat"],
+        current_position["lon"],
+    )
+    alt_delta = abs(current_position["alt"] - previous_position["alt"])
+    return math.sqrt((ground_delta ** 2) + (alt_delta ** 2)) >= POSITION_MOVING_THRESHOLD_M
+
+
+def get_controller_mode(controller):
+    if hasattr(controller, "get_mode"):
+        return controller.get_mode()
+    return getattr(controller.master, "flightmode", "UNKNOWN")
+
+
+def get_controller_armed_status(controller):
+    if hasattr(controller, "is_armed"):
+        return controller.is_armed()
+    try:
+        return bool(controller.master.motors_armed())
+    except Exception:
+        return False
+
+
+def print_waypoint_debug(controller, label, waypoint, position, distance):
+    current_alt = position["alt"] if position is not None else None
+    distance_text = f"{distance:.2f}m" if distance is not None else "None"
+    altitude_text = f"{current_alt:.2f}m" if current_alt is not None else "None"
+    print(
+        f"STATUS {label}: "
+        f"target_wp={waypoint.get('seq', 'runtime')} "
+        f"distance={distance_text} "
+        f"alt={altitude_text} "
+        f"target_alt={waypoint['alt']:.1f}m "
+        f"mode={get_controller_mode(controller)} "
+        f"armed={get_controller_armed_status(controller)} "
+        f"target_lat={waypoint['lat']:.7f}, "
+        f"target_lon={waypoint['lon']:.7f}"
+    )
+
+
+def redzone_polygon_to_xy():
+    return [
         latlon_to_xy(lat, lon, _home_lat, _home_lon)
         for lat, lon in REDZONE_POLYGON_LATLON
     ]
-    xmin = min(point[0] for point in redzone_points_xy) - margin
-    xmax = max(point[0] for point in redzone_points_xy) + margin
-    ymin = min(point[1] for point in redzone_points_xy) - margin
-    ymax = max(point[1] for point in redzone_points_xy) + margin
-    box = {"xmin": xmin, "xmax": xmax, "ymin": ymin, "ymax": ymax}
-    print(f"redzone_box_xy: {box}")
-    return box
+
+
+def make_redzone_geometry(margin=REDZONE_BYPASS_MARGIN_M):
+    global _redzone_geometry_logged
+
+    polygon_xy = redzone_polygon_to_xy()
+    x_values = [point[0] for point in polygon_xy]
+    y_values = [point[1] for point in polygon_xy]
+    actual_box = {
+        "xmin": min(x_values),
+        "xmax": max(x_values),
+        "ymin": min(y_values),
+        "ymax": max(y_values),
+    }
+    expanded_box = {
+        "xmin": actual_box["xmin"] - margin,
+        "xmax": actual_box["xmax"] + margin,
+        "ymin": actual_box["ymin"] - margin,
+        "ymax": actual_box["ymax"] + margin,
+    }
+    polygon_edges = [
+        (polygon_xy[index], polygon_xy[(index + 1) % len(polygon_xy)])
+        for index in range(len(polygon_xy))
+    ]
+
+    if not _redzone_geometry_logged:
+        print(f"redzone_polygon_xy: {polygon_xy}")
+        print(f"redzone_bounding_box_xy: {actual_box}")
+        print(f"redzone_expanded_bounding_box_xy: {expanded_box}")
+        print(f"redzone_bounding_box_width: {expanded_box['xmax'] - expanded_box['xmin']:.2f} m")
+        print(f"redzone_bounding_box_height: {expanded_box['ymax'] - expanded_box['ymin']:.2f} m")
+        print(f"redzone_actual_polygon_width: {actual_box['xmax'] - actual_box['xmin']:.2f} m")
+        print(f"redzone_actual_polygon_height: {actual_box['ymax'] - actual_box['ymin']:.2f} m")
+        _redzone_geometry_logged = True
+
+    return {
+        "polygon_xy": polygon_xy,
+        "polygon_edges": polygon_edges,
+        "actual_box": actual_box,
+        "expanded_box": expanded_box,
+    }
+
+
+def make_redzone_box(margin=REDZONE_BYPASS_MARGIN_M):
+    return make_redzone_geometry(margin)["expanded_box"]
 
 
 def point_inside_box(point, box):
     x, y = point
     return box["xmin"] <= x <= box["xmax"] and box["ymin"] <= y <= box["ymax"]
+
+
+def point_inside_polygon(point, polygon):
+    x, y = point
+    inside = False
+    count = len(polygon)
+
+    for index in range(count):
+        x1, y1 = polygon[index]
+        x2, y2 = polygon[(index + 1) % count]
+
+        cross = ((y - y1) * (x2 - x1)) - ((x - x1) * (y2 - y1))
+        if (
+            abs(cross) < 1e-9
+            and min(x1, x2) <= x <= max(x1, x2)
+            and min(y1, y2) <= y <= max(y1, y2)
+        ):
+            return True
+
+        crosses_y = (y1 > y) != (y2 > y)
+        if crosses_y:
+            denominator = y2 - y1
+            if abs(denominator) < 1e-12:
+                continue
+            intersect_x = ((x2 - x1) * (y - y1) / denominator) + x1
+            if x < intersect_x:
+                inside = not inside
+
+    return inside
 
 
 def orientation(a, b, c):
@@ -385,6 +539,58 @@ def segment_crosses_box(start_xy, end_xy, box):
     return False
 
 
+def segment_intersects_polygon(start_xy, end_xy, polygon_edges):
+    for edge_start, edge_end in polygon_edges:
+        if segments_intersect(start_xy, end_xy, edge_start, edge_end):
+            return True
+
+    return False
+
+
+def redzone_segment_decision(start_xy, end_xy, target_xy=None, block_current_near=False):
+    geometry = make_redzone_geometry(REDZONE_BYPASS_MARGIN_M)
+    target_xy = target_xy if target_xy is not None else end_xy
+    crosses_box = segment_crosses_box(start_xy, end_xy, geometry["expanded_box"])
+    intersects_polygon = False
+    if crosses_box:
+        intersects_polygon = segment_intersects_polygon(
+            start_xy,
+            end_xy,
+            geometry["polygon_edges"],
+        )
+    waypoint_inside_polygon = point_inside_polygon(target_xy, geometry["polygon_xy"])
+    current_inside_polygon = point_inside_polygon(start_xy, geometry["polygon_xy"])
+    current_near_polygon = point_inside_box(start_xy, geometry["expanded_box"])
+    final_redzone_blocked = (
+        intersects_polygon
+        or waypoint_inside_polygon
+        or current_inside_polygon
+        or (block_current_near and current_near_polygon)
+    )
+
+    return {
+        "geometry": geometry,
+        "crosses_box": crosses_box,
+        "intersects_polygon": intersects_polygon,
+        "waypoint_inside_polygon": waypoint_inside_polygon,
+        "current_inside_polygon": current_inside_polygon,
+        "current_near_polygon": current_near_polygon,
+        "final_redzone_blocked": final_redzone_blocked,
+    }
+
+
+def print_redzone_decision(decision):
+    print(
+        "REDZONE "
+        f"crosses_box={decision['crosses_box']} "
+        f"intersects_polygon={decision['intersects_polygon']} "
+        f"waypoint_inside_polygon={decision['waypoint_inside_polygon']} "
+        f"current_inside_polygon={decision['current_inside_polygon']} "
+        f"current_near_polygon={decision['current_near_polygon']} "
+        f"blocked={decision['final_redzone_blocked']}"
+    )
+
+
 def route_length(points):
     total = 0.0
     for first, second in zip(points, points[1:]):
@@ -409,38 +615,61 @@ def generate_box_bypass(start_xy, end_xy, box):
     dx = abs(end_xy[0] - start_xy[0])
     dy = abs(end_xy[1] - start_xy[1])
 
-    if dy < dx:
-        print("Bypass generation failed: current red-zone local bypass expects vertical sweep lines")
-        return None, None
+    if dy >= dx:
+        original_x = start_xy[0]
+        direction = "DOWN" if end_xy[1] < start_xy[1] else "UP"
 
-    original_x = start_xy[0]
-    direction = "DOWN" if end_xy[1] < start_xy[1] else "UP"
-    side_clearance_x = clearance_m
-    path_clearance_y = clearance_m
+        left_x = box["xmin"] - clearance_m
+        right_x = box["xmax"] + clearance_m
+        left_distance = abs(original_x - left_x)
+        right_distance = abs(right_x - original_x)
 
-    left_x = box["xmin"] - side_clearance_x
-    right_x = box["xmax"] + side_clearance_x
-    left_distance = abs(original_x - left_x)
-    right_distance = abs(right_x - original_x)
+        if left_distance <= right_distance:
+            chosen_side = "LEFT"
+            side_x = left_x
+        else:
+            chosen_side = "RIGHT"
+            side_x = right_x
 
-    if left_distance <= right_distance:
-        chosen_side = "LEFT"
-        side_x = left_x
+        if direction == "DOWN":
+            before_y = box["ymax"] + clearance_m
+            after_y = box["ymin"] - clearance_m
+        else:
+            before_y = box["ymin"] - clearance_m
+            after_y = box["ymax"] + clearance_m
+
+        before_redzone_point = (original_x, before_y)
+        side_point_1 = (side_x, before_y)
+        side_point_2 = (side_x, after_y)
+        return_point = (original_x, after_y)
     else:
-        chosen_side = "RIGHT"
-        side_x = right_x
+        original_y = start_xy[1]
+        direction = "LEFT" if end_xy[0] < start_xy[0] else "RIGHT"
 
-    if direction == "DOWN":
-        before_y = box["ymax"] + path_clearance_y
-        after_y = box["ymin"] - path_clearance_y
-    else:
-        before_y = box["ymin"] - path_clearance_y
-        after_y = box["ymax"] + path_clearance_y
+        below_y = box["ymin"] - clearance_m
+        above_y = box["ymax"] + clearance_m
+        below_distance = abs(original_y - below_y)
+        above_distance = abs(above_y - original_y)
 
-    before_redzone_point = (original_x, before_y)
-    side_point_1 = (side_x, before_y)
-    side_point_2 = (side_x, after_y)
-    return_point = (original_x, after_y)
+        if below_distance <= above_distance:
+            chosen_side = "LOWER"
+            side_y = below_y
+        else:
+            chosen_side = "UPPER"
+            side_y = above_y
+
+        if direction == "RIGHT":
+            before_x = box["xmin"] - clearance_m
+            after_x = box["xmax"] + clearance_m
+        else:
+            before_x = box["xmax"] + clearance_m
+            after_x = box["xmin"] - clearance_m
+
+        before_redzone_point = (before_x, original_y)
+        side_point_1 = (before_x, side_y)
+        side_point_2 = (after_x, side_y)
+        return_point = (after_x, original_y)
+
     bypass_points = [
         before_redzone_point,
         side_point_1,
@@ -449,19 +678,15 @@ def generate_box_bypass(start_xy, end_xy, box):
     ]
 
     full_route = [start_xy] + bypass_points + [end_xy]
-    if route_crosses_box(full_route, box):
+    safe_route = bypass_points[:]
+    if route_crosses_box(safe_route, box):
         print("Bypass generation failed: close local bypass still crosses expanded red-zone box")
         return None, None
 
-    print(f"sweep direction: {direction}")
-    print(f"chosen side: {chosen_side}")
-    print(f"before_redzone_point: {before_redzone_point}")
-    print(f"side_point_1: {side_point_1}")
-    print(f"side_point_2: {side_point_2}")
-    print(f"return_point: {return_point}")
-    print(f"original_next_wp: {end_xy}")
-    print(f"bypass distance: {route_length(full_route):.2f} m")
-    print(f"bypass points: {bypass_points}")
+    print(
+        f"BYPASS direction={direction} side={chosen_side} "
+        f"distance={route_length(full_route):.2f}m points={bypass_points}"
+    )
     return chosen_side, bypass_points
 
 
@@ -483,6 +708,85 @@ def bypass_xy_to_latlon_waypoints(bypass_points_xy, altitude):
     return bypass_points_latlon
 
 
+def send_world_velocity(controller, vx_east, vy_north, vz=0.0):
+    controller.master.mav.set_position_target_local_ned_send(
+        int(time.time() * 1000) & 0xFFFFFFFF,
+        controller.master.target_system,
+        controller.master.target_component,
+        1,
+        0b0000111111000111,
+        0, 0, 0,
+        vy_north, vx_east, vz,
+        0, 0, 0,
+        0, 0,
+    )
+
+
+def move_world_delta_slow(controller, cap, dx, dy, label):
+    distance = math.sqrt((dx ** 2) + (dy ** 2))
+    if distance < 0.05:
+        return "complete"
+
+    if abs(dx) >= abs(dy):
+        speed = BYPASS_FORWARD_SPEED
+    else:
+        speed = BYPASS_SIDE_SPEED
+
+    duration = distance / max(speed, 0.05)
+    vx_east = (dx / distance) * speed
+    vy_north = (dy / distance) * speed
+    print(f"{label}: distance={distance:.2f}m speed={speed:.2f}m/s")
+
+    end_time = time.time() + duration
+    while time.time() < end_time:
+        send_world_velocity(controller, vx_east, vy_north, 0.0)
+        frame = read_camera_frame(cap)
+        if frame is not None:
+            key = show_frame(frame, label)
+            if key == ord("q"):
+                controller.stop()
+                return "quit"
+        time.sleep(0.1)
+
+    controller.stop()
+    time.sleep(BYPASS_TURN_HOVER)
+    return "complete"
+
+
+def follow_bypass_velocity_path(controller, cap, bypass_points_xy):
+    current_position = get_current_position(controller)
+    if current_position is None:
+        print("Bypass failed: current position unavailable")
+        controller.stop()
+        return "position_failed"
+
+    current_xy = latlon_to_xy(
+        current_position["lat"],
+        current_position["lon"],
+        _home_lat,
+        _home_lon,
+    )
+
+    print("bypass started")
+    for index, target_xy in enumerate(bypass_points_xy, start=1):
+        dx = target_xy[0] - current_xy[0]
+        dy = target_xy[1] - current_xy[1]
+        status = move_world_delta_slow(
+            controller,
+            cap,
+            dx,
+            dy,
+            f"Bypass segment {index}",
+        )
+        if status != "complete":
+            return status
+        current_xy = target_xy
+
+    print("returning to original yellow path")
+    print("bypass completed")
+    return "complete"
+
+
 def follow_bypass_waypoints(controller, cap, bypass_points_latlon, altitude):
     for index, bypass_point in enumerate(bypass_points_latlon, start=1):
         waypoint = waypoint_with_altitude(bypass_point, altitude)
@@ -493,7 +797,7 @@ def follow_bypass_waypoints(controller, cap, bypass_points_latlon, altitude):
             f"Runtime red-zone bypass WP{index}",
             watch_for_qr=False,
             avoid_redzone_visual=True,
-            avoid_redzone_box=True,
+            avoid_redzone_box=False,
         )
         if status in ("quit", "camera_failed", "redzone_blocked"):
             return status
@@ -598,40 +902,30 @@ def hover_with_camera(controller, cap, hover_time_s, label, hold_waypoint=None):
 
 
 def get_latest_global_position(controller, timeout_s=0.2):
-    msg = controller.master.recv_match(
-        type="GLOBAL_POSITION_INT",
-        blocking=True,
-        timeout=timeout_s,
-    )
-
-    if msg is None:
+    position = controller.get_global_position(timeout_s=0.0)
+    if position is None:
         return None
 
     return cache_position({
         "type": "global",
-        "source": "latest GLOBAL_POSITION_INT",
-        "lat": msg.lat / 1e7,
-        "lon": msg.lon / 1e7,
-        "alt": msg.relative_alt / 1000.0,
+        "source": "GLOBAL_POSITION_INT",
+        "lat": position["lat"],
+        "lon": position["lon"],
+        "alt": position["relative_alt"],
     })
 
 
 def get_latest_gps_raw_position(controller, timeout_s=0.2):
-    msg = controller.master.recv_match(
-        type="GPS_RAW_INT",
-        blocking=True,
-        timeout=timeout_s,
-    )
-
-    if msg is None or msg.lat == 0 or msg.lon == 0:
+    msg = controller.get_cached_message("GPS_RAW_INT")
+    if msg is None or msg["lat"] == 0 or msg["lon"] == 0:
         return None
 
     altitude = _last_valid_position["alt"] if _last_valid_position is not None else 0.0
     return cache_position({
         "type": "global",
-        "source": "latest GPS_RAW_INT",
-        "lat": msg.lat / 1e7,
-        "lon": msg.lon / 1e7,
+        "source": "GPS_RAW_INT",
+        "lat": msg["lat"],
+        "lon": msg["lon"],
         "alt": altitude,
     })
 
@@ -656,45 +950,46 @@ def local_position_to_global(north, east, down):
     }
 
 
+def get_current_position(controller, print_source=False):
+    global_position = controller.get_global_position(timeout_s=0.0)
+    if global_position is not None:
+        position = cache_position({
+            "type": "global",
+            "source": "GLOBAL_POSITION_INT",
+            "lat": global_position["lat"],
+            "lon": global_position["lon"],
+            "alt": global_position["relative_alt"],
+        })
+        if print_source:
+            print("Position source: GLOBAL_POSITION_INT")
+        return position
+
+    local_position = controller.get_local_position(timeout_s=0.0)
+    if local_position is not None:
+        north, east, down = local_position
+        position = cache_position(local_position_to_global(north, east, down))
+        position["source"] = "LOCAL_POSITION_NED"
+        if print_source:
+            print("Position source: LOCAL_POSITION_NED")
+        return position
+
+    if _last_valid_position is not None:
+        if print_source:
+            print("Position source: last_valid_position")
+        return dict(_last_valid_position)
+
+    return None
+
+
 def get_safe_position(controller):
     end_time = time.time() + POSITION_RETRY_TIMEOUT_S
 
     while time.time() < end_time:
-        position = controller.get_global_position(timeout_s=0.4)
+        position = get_current_position(controller, print_source=True)
         if position is not None:
-            safe_position = cache_position({
-                "type": "global",
-                "source": "controller.get_global_position",
-                "lat": position["lat"],
-                "lon": position["lon"],
-                "alt": position["relative_alt"],
-            })
-            print(f"Current position source used: {safe_position['source']}")
-            return safe_position
-
-        position = get_latest_global_position(controller, timeout_s=0.2)
-        if position is not None:
-            print(f"Current position source used: {position['source']}")
             return position
 
-        position = get_latest_gps_raw_position(controller, timeout_s=0.2)
-        if position is not None:
-            print(f"Current position source used: {position['source']}")
-            return position
-
-        local_position = controller.get_local_position(timeout_s=0.2)
-        if local_position is not None:
-            north, east, down = local_position
-            safe_position = cache_position(local_position_to_global(north, east, down))
-            print(f"Current position source used: {safe_position['source']}")
-            return safe_position
-
-        if _last_valid_position is not None:
-            print("Current position source used: last_valid_position cache")
-            return dict(_last_valid_position)
-
-        print("Current position unavailable, holding and retrying...")
-        controller.stop()
+        print("Current position unavailable, waiting for telemetry cache...")
         time.sleep(0.2)
 
     print("Current position unavailable after retry")
@@ -706,7 +1001,8 @@ def get_safe_current_position(controller):
 
 
 def command_position_hold(controller, position):
-    if position["type"] == "global":
+    position_type = position.get("type", "global" if "lat" in position and "lon" in position else "local")
+    if position_type == "global":
         controller.goto_global_location(position["lat"], position["lon"], position["alt"])
     else:
         controller.goto_local_position(position["north"], position["east"], position["alt"])
@@ -717,7 +1013,7 @@ def get_current_altitude(controller):
     if position is not None:
         cache_position({
             "type": "global",
-            "source": "get_current_altitude GLOBAL_POSITION_INT cache",
+            "source": "GLOBAL_POSITION_INT",
             "lat": position["lat"],
             "lon": position["lon"],
             "alt": position["relative_alt"],
@@ -740,6 +1036,7 @@ def change_altitude_at_current_xy(controller, cap, target_alt_m, label):
     target_position["alt"] = target_alt_m
 
     started_at = time.time()
+    last_status_time = 0
     while time.time() - started_at < WAYPOINT_TIMEOUT_S:
         command_position_hold(controller, target_position)
         current_alt, altitude_source = get_current_altitude(controller)
@@ -748,15 +1045,19 @@ def change_altitude_at_current_xy(controller, cap, target_alt_m, label):
             altitude_source = "last_valid_position cache"
 
         if current_alt is not None:
-            print(
-                f"{label}: current_alt={current_alt:.2f}m, "
-                f"target_alt={target_alt_m:.2f}m, source={altitude_source}"
-            )
+            if time.time() - last_status_time >= WAYPOINT_DEBUG_INTERVAL_S:
+                print(
+                    f"STATUS {label}: altitude={current_alt:.2f}m "
+                    f"target_alt={target_alt_m:.2f}m source={altitude_source}"
+                )
+                last_status_time = time.time()
             if abs(current_alt - target_alt_m) <= ALTITUDE_TOLERANCE_M:
                 print(f"{label}: reached target altitude {target_alt_m:.2f}m")
                 return "reached", target_position
         else:
-            print(f"{label}: altitude unavailable while changing altitude")
+            if time.time() - last_status_time >= WAYPOINT_DEBUG_INTERVAL_S:
+                print(f"STATUS {label}: altitude unavailable")
+                last_status_time = time.time()
 
         frame = read_camera_frame(cap)
         if frame is not None:
@@ -788,33 +1089,51 @@ def goto_waypoint(
 
     started_at = time.time()
     last_detection_time = 0
+    last_debug_time = 0
+    last_goto_sent_time = 0
+    last_position_change_time = time.time()
+    last_motion_position = None
+    stuck_warning_printed = False
     suppress_qr_until = 0
     detections = []
-    arrival_tolerance_m = arrival_tolerance_m or POSITION_TOLERANCE_M
+    arrival_tolerance_m = arrival_tolerance_m or WAYPOINT_ACCEPT_RADIUS
 
     if avoid_redzone_box and len(REDZONE_POLYGON_LATLON) >= 3:
         destination_xy = waypoint_to_xy(waypoint)
-        box = make_redzone_box(REDZONE_BYPASS_MARGIN_M)
-        if point_inside_box(destination_xy, box):
-            print(f"Destination rejected inside expanded red-zone box: {destination_xy}")
+        geometry = make_redzone_geometry(REDZONE_BYPASS_MARGIN_M)
+        waypoint_inside_polygon = point_inside_polygon(destination_xy, geometry["polygon_xy"])
+        if waypoint_inside_polygon:
+            print("REDZONE blocked=True reason=target_inside_polygon")
+            print(f"Destination rejected inside actual red-zone polygon: {destination_xy}")
             controller.stop()
             return "redzone_blocked", None
 
     while time.time() - started_at < WAYPOINT_TIMEOUT_S:
-        controller.goto_global_location(
-            waypoint["lat"],
-            waypoint["lon"],
-            waypoint["alt"],
-        )
-        update = controller.get_global_position(timeout_s=0.01)
-        if update is not None:
-            cache_position({
-                "type": "global",
-                "source": "goto_waypoint GLOBAL_POSITION_INT cache",
-                "lat": update["lat"],
-                "lon": update["lon"],
-                "alt": update["relative_alt"],
-            })
+        now = time.time()
+        current_position = get_current_position(controller)
+
+        if last_goto_sent_time == 0 or now - last_goto_sent_time >= WAYPOINT_COMMAND_INTERVAL_S:
+            if avoid_redzone_box and current_position is not None and len(REDZONE_POLYGON_LATLON) >= 3:
+                current_xy = latlon_to_xy(
+                    current_position["lat"],
+                    current_position["lon"],
+                    _home_lat,
+                    _home_lon,
+                )
+                target_xy = waypoint_to_xy(waypoint)
+                decision = redzone_segment_decision(current_xy, target_xy)
+                if decision["final_redzone_blocked"]:
+                    print_redzone_decision(decision)
+                    print(f"REDZONE blocked=True current_wp={label}")
+                    controller.stop()
+                    return "redzone_blocked", None
+
+            controller.goto_global_location(
+                waypoint["lat"],
+                waypoint["lon"],
+                waypoint["alt"],
+            )
+            last_goto_sent_time = now
 
         frame = read_camera_frame(cap)
         if frame is None:
@@ -860,11 +1179,35 @@ def goto_waypoint(
                 set_mission_state("RESUME_LAWN_MOWER")
                 print(f"Resuming path after visual red-zone backup, confidence={red_confidence:.2f}")
 
-        distance = controller.distance_to_global_location(
-            waypoint["lat"],
-            waypoint["lon"],
-            waypoint["alt"],
-        )
+        if current_position is None:
+            distance = None
+            started_at = time.time()
+        else:
+            distance = distance_from_position_to_waypoint(current_position, waypoint)
+
+            if position_changed_enough(last_motion_position, current_position):
+                last_motion_position = dict(current_position)
+                last_position_change_time = time.time()
+                stuck_warning_printed = False
+
+        if time.time() - last_debug_time >= WAYPOINT_DEBUG_INTERVAL_S:
+            print_waypoint_debug(controller, label, waypoint, current_position, distance)
+            last_debug_time = time.time()
+
+        if current_position is not None and time.time() - last_position_change_time >= POSITION_STUCK_TIMEOUT_S:
+            if not stuck_warning_printed:
+                print("Position not updating / drone not moving")
+                stuck_warning_printed = True
+            controller.set_mode("GUIDED")
+            controller.set_cruise_speed(SURFACE_SPEED_MPS)
+            waypoint["alt"] = SURFACE_ALTITUDE_M if waypoint.get("seq") in range(AUTO_PATH_START_WP_SEQ, AUTO_PATH_END_WP_SEQ + 1) else waypoint["alt"]
+            controller.goto_global_location(
+                waypoint["lat"],
+                waypoint["lon"],
+                waypoint["alt"],
+            )
+            last_goto_sent_time = time.time()
+            last_position_change_time = time.time()
 
         if distance is not None and distance <= arrival_tolerance_m:
             print(f"Reached {label}")
@@ -912,98 +1255,199 @@ def goto_waypoint_until_reached(
         return status, decoded_text
 
 
+def change_altitude_until_reached(controller, cap, target_alt_m, label):
+    while True:
+        status, target_position = change_altitude_at_current_xy(
+            controller,
+            cap,
+            target_alt_m,
+            label,
+        )
+        if status == "timeout":
+            print(f"{label}: timeout occurred, retrying altitude change")
+            continue
+        return status, target_position
+
+
+def wp2_scan_adjustment(controller, cap, retry_number):
+    direction = 1.0 if retry_number % 2 == 1 else -1.0
+    movement = "forward" if direction > 0 else "backward"
+    print(f"WP2 QR retry {retry_number}: small {movement} camera adjustment")
+    end_time = time.time() + WP2_SCAN_NUDGE_TIME_S
+
+    while time.time() < end_time:
+        controller.send_body_velocity(WP2_SCAN_NUDGE_SPEED_MPS * direction, 0.0, 0.0)
+        frame = read_camera_frame(cap)
+        if frame is not None:
+            show_frame(frame, f"WP2 QR adjust {movement}")
+        time.sleep(0.1)
+
+    controller.stop()
+    time.sleep(0.5)
+
+
 def scan_start_qr_at_waypoint_2(controller, cap, start_qr_waypoint):
     start_qr_waypoint = waypoint_with_altitude(start_qr_waypoint, START_QR_ALT_M)
-    status, _ = goto_waypoint_until_reached(controller, cap, start_qr_waypoint, "WP2 Start QR at 5m")
+    status, _ = goto_waypoint_until_reached(
+        controller,
+        cap,
+        start_qr_waypoint,
+        "WP2 Start QR",
+        arrival_tolerance_m=WAYPOINT_ACCEPT_RADIUS,
+    )
     if status in ("quit", "camera_failed"):
         return None
 
-    print("At WP2: scanning start QR")
-    started_at = time.time()
-    last_detection_time = 0
-    detections = []
+    print("WP2 QR scan started")
+    detection_interval_s = 1.0 / QR_DETECT_FPS
 
-    while time.time() - started_at < START_QR_TIMEOUT_S:
+    for retry_number in range(1, START_QR_MAX_RETRIES + 1):
+        print(f"WP2 QR scan retry number: {retry_number}/{START_QR_MAX_RETRIES}")
+        scan_started_at = time.time()
+        last_detection_time = 0
+        detections = []
+
+        while time.time() - scan_started_at < START_QR_SCAN_TIMEOUT:
+            command_position_hold(controller, start_qr_waypoint)
+
+            frame = read_camera_frame(cap)
+            if frame is None:
+                return None
+
+            elapsed_s = time.time() - scan_started_at
+            if time.time() - last_detection_time >= detection_interval_s:
+                detections = detect_qrs(frame)
+                last_detection_time = time.time()
+                print(
+                    f"WP2 QR scan elapsed time: {elapsed_s:.1f}s, "
+                    f"QR detections count: {len(detections)}"
+                )
+
+            for detection in detections:
+                detection_type = detection.get("type", "qr")
+                print(f"WP2 raw detection object keys: {list(detection.keys())}")
+                print(f"WP2 detection type: {detection_type}")
+                print(f"WP2 QR bbox: {detection.get('bbox')}")
+                draw_detection(frame, detection, "START QR")
+
+            if detections:
+                for detection in detections:
+                    bbox = detection.get("bbox")
+                    if bbox is None:
+                        continue
+
+                    decoded_text, processed = decode_qr_crop(frame, bbox)
+                    if processed is not None:
+                        cv2.imshow("Processed QR", processed)
+
+                    print(f"WP2 QR decoded text: {decoded_text}")
+                    if decoded_text:
+                        target_location = decoded_text.strip()
+                        print(f"WP2 target value saved: {target_location}")
+                        return target_location
+
+                print("WP2 QR detected but not decoded, continuing scan")
+                detections = []
+
+            key = show_frame(frame, "WP2: scan start QR")
+            if key == ord("q"):
+                controller.stop()
+                return None
+
+            time.sleep(LOOP_SLEEP_S)
+
+        print(f"WP2 QR scan retry {retry_number} reached 60 seconds without decode")
+        if retry_number < START_QR_MAX_RETRIES:
+            wp2_scan_adjustment(controller, cap, retry_number)
+
+    print("ERROR: WP2 compulsory start QR was not decoded after all retries")
+    print("Holding position at WP2. Mission will not continue without target value.")
+    while True:
         command_position_hold(controller, start_qr_waypoint)
-
         frame = read_camera_frame(cap)
-        if frame is None:
-            return None
+        if frame is not None:
+            key = show_frame(frame, "WP2 QR failed: holding")
+            if key == ord("q"):
+                controller.stop()
+                return None
+        time.sleep(0.2)
 
-        if time.time() - last_detection_time >= DETECTION_INTERVAL_S:
-            detections = detect_qrs(frame)
-            last_detection_time = time.time()
-            print(f"WP2 Start QR detections = {len(detections)}")
-
-        for detection in detections:
-            draw_detection(frame, detection, "START QR")
-
-        if detections:
-            controller.stop()
-            time.sleep(0.6)
-            decoded_text = align_and_decode_qr(controller, cap, "START QR")
-            if decoded_text:
-                print(f"Stored target value from start QR: {decoded_text}")
-                return decoded_text
-
-            print("Start QR was detected but not decoded, trying again")
-
-        key = show_frame(frame, "WP2: scan start QR")
-        if key == ord("q"):
-            controller.stop()
-            return None
-
-    print("Start QR scan timeout")
     return None
 
 
 def build_surface_waypoints(mission_items):
-    return [
-        waypoint_with_altitude(mission_items[seq], SEARCH_ALT_M)
+    missing_surface_wps = [
+        seq
         for seq in range(AUTO_PATH_START_WP_SEQ, AUTO_PATH_END_WP_SEQ + 1)
-        if seq in mission_items
+        if seq not in mission_items
     ]
+    if missing_surface_wps:
+        raise RuntimeError(f"Mission is missing surface waypoint(s): {missing_surface_wps}")
+
+    waypoints = []
+    for seq in range(AUTO_PATH_START_WP_SEQ, AUTO_PATH_END_WP_SEQ + 1):
+        original_waypoint = mission_items[seq]
+        commanded_waypoint = waypoint_with_altitude(original_waypoint, SURFACE_ALTITUDE_M)
+        commanded_waypoint["original_alt"] = original_waypoint.get("alt")
+        waypoints.append(commanded_waypoint)
+
+    return waypoints
 
 
 def run_surface_search(controller, cap, target_value, mission_items):
     set_mission_state("NORMAL_LAWN_MOWER")
     print("Entering 40x30 m surface auto path")
+    controller.set_cruise_speed(SURFACE_SPEED_MPS)
     if len(REDZONE_POLYGON_LATLON) < 3:
         print("Red-zone coordinate polygon not configured; coordinate avoidance inactive")
 
     previous_waypoint = mission_items[SURFACE_ENTRANCE_WP_SEQ]
 
     for waypoint in build_surface_waypoints(mission_items):
+        active_segment_start_wp = previous_waypoint
+        active_segment_target_wp = waypoint
+        resume_target_wp = waypoint
         current_index = previous_waypoint.get("seq", "runtime")
         next_index = waypoint.get("seq", "runtime")
-        print(f"current waypoint index: {current_index}")
-        print(f"next waypoint index: {next_index}")
-        print(f"current_wp_latlon: ({previous_waypoint['lat']:.7f}, {previous_waypoint['lon']:.7f})")
-        print(f"next_wp_latlon: ({waypoint['lat']:.7f}, {waypoint['lon']:.7f})")
+        print(
+            f"SEGMENT current_wp={current_index} target_wp={next_index} "
+            f"alt={SURFACE_ALTITUDE_M:.1f}m"
+        )
+        print(
+            f"active segment start/target: "
+            f"{active_segment_start_wp.get('seq', 'runtime')} -> "
+            f"{active_segment_target_wp.get('seq', 'runtime')}"
+        )
+        print(f"resume_target_wp: {resume_target_wp.get('seq', 'runtime')}")
 
         intersects_redzone = False
         box = None
 
         if len(REDZONE_POLYGON_LATLON) >= 3:
-            current_wp_xy = waypoint_to_xy(previous_waypoint)
+            live_position = get_current_position(controller)
+            if live_position is not None:
+                current_wp_xy = latlon_to_xy(
+                    live_position["lat"],
+                    live_position["lon"],
+                    _home_lat,
+                    _home_lon,
+                )
+            else:
+                current_wp_xy = waypoint_to_xy(previous_waypoint)
             next_wp_xy = waypoint_to_xy(waypoint)
-            box = make_redzone_box(REDZONE_BYPASS_MARGIN_M)
-
-            print(f"current_wp_xy: {current_wp_xy}")
-            print(f"next_wp_xy: {next_wp_xy}")
-            print(f"redzone_polygon_latlon: {REDZONE_POLYGON_LATLON}")
-
-            intersects_redzone = segment_crosses_box(
+            decision = redzone_segment_decision(
                 current_wp_xy,
                 next_wp_xy,
-                box,
+                block_current_near=True,
             )
-
-        print(f"crosses_box: {intersects_redzone}")
+            box = decision["geometry"]["expanded_box"]
+            intersects_redzone = decision["final_redzone_blocked"]
+            print_redzone_decision(decision)
 
         if intersects_redzone:
             set_mission_state("REDZONE_COORDINATE_BYPASS")
             print("REDZONE_COORDINATE_BYPASS triggered")
+            controller.stop()
             chosen_side, bypass_points_xy = generate_box_bypass(
                 current_wp_xy,
                 next_wp_xy,
@@ -1020,26 +1464,29 @@ def run_surface_search(controller, cap, target_value, mission_items):
                 controller.stop()
                 return None
 
-            bypass_waypoints = bypass_xy_to_latlon_waypoints(bypass_points_xy, waypoint["alt"])
-            bypass_status = follow_bypass_waypoints(
+            bypass_status = follow_bypass_velocity_path(
                 controller,
                 cap,
-                bypass_waypoints,
-                waypoint["alt"],
+                bypass_points_xy,
             )
             if bypass_status != "complete":
+                print("Bypass failed, holding position")
+                controller.stop()
                 return None
 
             set_mission_state("RESUME_LAWN_MOWER")
-            print("resumed lawn mower")
+            print("returning to original yellow path")
+
+        print(f"Going to resume_target_wp: {resume_target_wp.get('seq', 'runtime')}")
 
         status, decoded_text = goto_waypoint_until_reached(
             controller,
             cap,
-            waypoint,
-            f"Surface WP{waypoint['seq']}",
+            resume_target_wp,
+            f"Surface WP{resume_target_wp['seq']}",
             watch_for_qr=True,
             target_value=target_value,
+            arrival_tolerance_m=WAYPOINT_ACCEPT_RADIUS,
             avoid_redzone_visual=True,
             avoid_redzone_box=True,
         )
@@ -1050,7 +1497,8 @@ def run_surface_search(controller, cap, target_value, mission_items):
         if status in ("quit", "camera_failed", "redzone_blocked"):
             return None
 
-        previous_waypoint = waypoint
+        print(f"reached resume target: {resume_target_wp.get('seq', 'runtime')}")
+        previous_waypoint = resume_target_wp
 
     print("Surface search completed, target was not found")
     return None
@@ -1059,11 +1507,12 @@ def run_surface_search(controller, cap, target_value, mission_items):
 def run_post_target_sequence(controller, cap, mission_items):
     set_mission_state("TARGET_QR_FOUND")
     controller.stop()
+    print("correct QR found")
     print("Correct QR detected, stopping lawn mower/search motion")
 
     set_mission_state("DESCEND_TO_5M")
     print("Descending to 5m")
-    status, payload_point = change_altitude_at_current_xy(
+    status, payload_point = change_altitude_until_reached(
         controller,
         cap,
         PAYLOAD_DESCENT_ALT_M,
@@ -1090,7 +1539,7 @@ def run_post_target_sequence(controller, cap, mission_items):
 
     set_mission_state("ASCEND_AFTER_HOVER")
     print("ascending to 10 m")
-    status, _ = change_altitude_at_current_xy(
+    status, _ = change_altitude_until_reached(
         controller,
         cap,
         RETURN_ALT_M,
@@ -1100,20 +1549,22 @@ def run_post_target_sequence(controller, cap, mission_items):
         print("ASCEND_AFTER_HOVER: position/altitude hold failed, continuing to WP16 at 10m")
 
     set_mission_state("GOTO_EXIT_WP16")
+    print("going to WP16 first")
     status, _ = goto_waypoint_until_reached(
         controller,
         cap,
         waypoint_with_altitude(mission_items[EXIT_CORRIDOR_WP_SEQ], RETURN_ALT_M),
         "Exit Corridor WP16 at 10m",
         watch_for_qr=False,
+        arrival_tolerance_m=WAYPOINT_ACCEPT_RADIUS,
     )
     if status in ("quit", "camera_failed"):
         return status
-    print("Reached waypoint 16")
+    print("reached WP16")
 
     set_mission_state("DESCEND_AT_EXIT_WP16")
     print("Exit corridor altitude active: descending to 2-3m at waypoint 16")
-    status, corridor_low_point = change_altitude_at_current_xy(
+    status, corridor_low_point = change_altitude_until_reached(
         controller,
         cap,
         EXIT_CORRIDOR_ALT_M,
@@ -1123,6 +1574,7 @@ def run_post_target_sequence(controller, cap, mission_items):
         return status
 
     set_mission_state("MOVE_EXIT_WP16_TO_WP17")
+    print("moving WP16 to WP17")
     print("Exit corridor altitude active: moving WP16 to WP17 at 2-3m")
     status, _ = goto_waypoint_until_reached(
         controller,
@@ -1130,6 +1582,7 @@ def run_post_target_sequence(controller, cap, mission_items):
         waypoint_with_altitude(mission_items[EXIT_CORRIDOR_END_WP_SEQ], EXIT_CORRIDOR_ALT_M),
         "Exit Corridor WP17 at 3m",
         watch_for_qr=False,
+        arrival_tolerance_m=WAYPOINT_ACCEPT_RADIUS,
     )
     if status in ("quit", "camera_failed"):
         return status
@@ -1137,7 +1590,7 @@ def run_post_target_sequence(controller, cap, mission_items):
 
     set_mission_state("ASCEND_AFTER_EXIT_WP17")
     print("ascending after exit corridor")
-    status, _ = change_altitude_at_current_xy(
+    status, _ = change_altitude_until_reached(
         controller,
         cap,
         RETURN_ALT_M,
@@ -1164,6 +1617,8 @@ def main():
         master = MavlinkConnection(CONNECTION_STRING).connect()
         controller = GuidedController(master)
         mission_items = controller.download_mission_items()
+        controller.start_telemetry_cache()
+        time.sleep(0.5)
         initialize_home_origin(controller, mission_items)
 
         required_wps = [
@@ -1202,7 +1657,8 @@ def main():
             controller,
             cap,
             waypoint_with_altitude(mission_items[CORRIDOR_ENTRANCE_WP_SEQ], EXIT_CORRIDOR_ALT_M),
-            "WP3 Corridor Entrance at 3m",
+            "WP3 Corridor Entrance",
+            arrival_tolerance_m=WAYPOINT_ACCEPT_RADIUS,
         )
         if status in ("quit", "camera_failed"):
             return
@@ -1211,9 +1667,20 @@ def main():
             controller,
             cap,
             waypoint_with_altitude(mission_items[SURFACE_ENTRANCE_WP_SEQ], EXIT_CORRIDOR_ALT_M),
-            "WP4 Corridor Exit at 3m",
+            "WP4 Surface Entrance",
+            arrival_tolerance_m=WAYPOINT_ACCEPT_RADIUS,
         )
         if status in ("quit", "camera_failed"):
+            return
+
+        set_mission_state("ASCEND_TO_SURFACE_ALTITUDE")
+        status, _ = change_altitude_until_reached(
+            controller,
+            cap,
+            SURFACE_ALTITUDE_M,
+            "Ascend after WP4 to 10m",
+        )
+        if status in ("quit", "position_failed"):
             return
 
         found_value = run_surface_search(controller, cap, target_value, mission_items)
@@ -1238,6 +1705,8 @@ def main():
             controller.land()
 
     finally:
+        if controller is not None:
+            controller.stop_telemetry_cache()
         if cap is not None:
             cap.release()
         cv2.destroyAllWindows()
