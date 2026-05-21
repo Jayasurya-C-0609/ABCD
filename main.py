@@ -29,6 +29,8 @@ from config import (
     REDZONE_VISUAL_MIN_AREA_RATIO,
     REDZONE_YOLO_CONF,
     RETURN_ALT_M,
+    SEARCH_ALT_M,
+    START_QR_ALT_M,
     START_QR_WP_SEQ,
     SURFACE_ENTRANCE_WP_SEQ,
     TAKEOFF_ALT_M,
@@ -484,7 +486,7 @@ def bypass_xy_to_latlon_waypoints(bypass_points_xy, altitude):
 def follow_bypass_waypoints(controller, cap, bypass_points_latlon, altitude):
     for index, bypass_point in enumerate(bypass_points_latlon, start=1):
         waypoint = waypoint_with_altitude(bypass_point, altitude)
-        status, _ = goto_waypoint(
+        status, _ = goto_waypoint_until_reached(
             controller,
             cap,
             waypoint,
@@ -879,8 +881,40 @@ def goto_waypoint(
     return "timeout", None
 
 
+def goto_waypoint_until_reached(
+    controller,
+    cap,
+    waypoint,
+    label,
+    watch_for_qr=False,
+    target_value=None,
+    arrival_tolerance_m=None,
+    avoid_redzone_visual=False,
+    avoid_redzone_box=True,
+):
+    while True:
+        status, decoded_text = goto_waypoint(
+            controller,
+            cap,
+            waypoint,
+            label,
+            watch_for_qr=watch_for_qr,
+            target_value=target_value,
+            arrival_tolerance_m=arrival_tolerance_m,
+            avoid_redzone_visual=avoid_redzone_visual,
+            avoid_redzone_box=avoid_redzone_box,
+        )
+
+        if status == "timeout":
+            print(f"{label}: timeout occurred, resending same waypoint command")
+            continue
+
+        return status, decoded_text
+
+
 def scan_start_qr_at_waypoint_2(controller, cap, start_qr_waypoint):
-    status, _ = goto_waypoint(controller, cap, start_qr_waypoint, "WP2 Start QR")
+    start_qr_waypoint = waypoint_with_altitude(start_qr_waypoint, START_QR_ALT_M)
+    status, _ = goto_waypoint_until_reached(controller, cap, start_qr_waypoint, "WP2 Start QR at 5m")
     if status in ("quit", "camera_failed"):
         return None
 
@@ -890,6 +924,8 @@ def scan_start_qr_at_waypoint_2(controller, cap, start_qr_waypoint):
     detections = []
 
     while time.time() - started_at < START_QR_TIMEOUT_S:
+        command_position_hold(controller, start_qr_waypoint)
+
         frame = read_camera_frame(cap)
         if frame is None:
             return None
@@ -897,6 +933,7 @@ def scan_start_qr_at_waypoint_2(controller, cap, start_qr_waypoint):
         if time.time() - last_detection_time >= DETECTION_INTERVAL_S:
             detections = detect_qrs(frame)
             last_detection_time = time.time()
+            print(f"WP2 Start QR detections = {len(detections)}")
 
         for detection in detections:
             draw_detection(frame, detection, "START QR")
@@ -922,7 +959,7 @@ def scan_start_qr_at_waypoint_2(controller, cap, start_qr_waypoint):
 
 def build_surface_waypoints(mission_items):
     return [
-        mission_items[seq]
+        waypoint_with_altitude(mission_items[seq], SEARCH_ALT_M)
         for seq in range(AUTO_PATH_START_WP_SEQ, AUTO_PATH_END_WP_SEQ + 1)
         if seq in mission_items
     ]
@@ -996,7 +1033,7 @@ def run_surface_search(controller, cap, target_value, mission_items):
             set_mission_state("RESUME_LAWN_MOWER")
             print("resumed lawn mower")
 
-        status, decoded_text = goto_waypoint(
+        status, decoded_text = goto_waypoint_until_reached(
             controller,
             cap,
             waypoint,
@@ -1063,7 +1100,7 @@ def run_post_target_sequence(controller, cap, mission_items):
         print("ASCEND_AFTER_HOVER: position/altitude hold failed, continuing to WP16 at 10m")
 
     set_mission_state("GOTO_EXIT_WP16")
-    status, _ = goto_waypoint(
+    status, _ = goto_waypoint_until_reached(
         controller,
         cap,
         waypoint_with_altitude(mission_items[EXIT_CORRIDOR_WP_SEQ], RETURN_ALT_M),
@@ -1087,7 +1124,7 @@ def run_post_target_sequence(controller, cap, mission_items):
 
     set_mission_state("MOVE_EXIT_WP16_TO_WP17")
     print("Exit corridor altitude active: moving WP16 to WP17 at 2-3m")
-    status, _ = goto_waypoint(
+    status, _ = goto_waypoint_until_reached(
         controller,
         cap,
         waypoint_with_altitude(mission_items[EXIT_CORRIDOR_END_WP_SEQ], EXIT_CORRIDOR_ALT_M),
@@ -1161,20 +1198,20 @@ def main():
             controller.stop()
             return
 
-        status, _ = goto_waypoint(
+        status, _ = goto_waypoint_until_reached(
             controller,
             cap,
-            mission_items[CORRIDOR_ENTRANCE_WP_SEQ],
-            "WP3 Corridor Entrance",
+            waypoint_with_altitude(mission_items[CORRIDOR_ENTRANCE_WP_SEQ], EXIT_CORRIDOR_ALT_M),
+            "WP3 Corridor Entrance at 3m",
         )
         if status in ("quit", "camera_failed"):
             return
 
-        status, _ = goto_waypoint(
+        status, _ = goto_waypoint_until_reached(
             controller,
             cap,
-            mission_items[SURFACE_ENTRANCE_WP_SEQ],
-            "WP4 Surface Entrance",
+            waypoint_with_altitude(mission_items[SURFACE_ENTRANCE_WP_SEQ], EXIT_CORRIDOR_ALT_M),
+            "WP4 Corridor Exit at 3m",
         )
         if status in ("quit", "camera_failed"):
             return
