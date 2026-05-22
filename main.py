@@ -11,14 +11,25 @@ from config import (
     BYPASS_FORWARD_SPEED,
     BYPASS_SIDE_SPEED,
     BYPASS_TURN_HOVER,
+    ALLOW_CORRIDOR_WITHOUT_BANNER,
     CAMERA_SOURCE,
     CONNECTION_STRING,
+    CORRIDOR_ALTITUDE_M,
     CORRIDOR_ENTRANCE_WP_SEQ,
+    CORRIDOR_SPEED,
     CRUISE_SPEED_MPS,
     DROIDCAM_URL,
     EXIT_CORRIDOR_END_WP_SEQ,
     EXIT_CORRIDOR_WP_SEQ,
-    EXIT_CORRIDOR_ALT_M,
+    GREEN_ALIGN_SPEED,
+    GREEN_ALIGN_TIMEOUT,
+    GREEN_ALIGN_TOLERANCE_X,
+    GREEN_ALIGN_TOLERANCE_Y,
+    GREEN_BANNER_CONF,
+    GREEN_BANNER_MODEL_PATH,
+    GREEN_DETECT_FPS,
+    GREEN_SEARCH_TIMEOUT,
+    GREEN_YAW_SPEED,
     PAYLOAD_DESCENT_ALT_M,
     PAYLOAD_HOVER_TIME_S,
     POSITION_TOLERANCE_M,
@@ -68,6 +79,8 @@ _detect_qrs = None
 _decode_qr_crop = None
 _red_model = None
 _red_model_available = None
+_green_model = None
+_green_model_available = None
 _last_frame_time = None
 _display_fps = 0.0
 _home_lat = None
@@ -162,6 +175,7 @@ def warm_up_vision_models():
     load_yolo_detector()
     load_qr_decoder()
     load_redzone_detector()
+    load_green_banner_detector()
 
 
 def load_redzone_detector():
@@ -230,6 +244,66 @@ def detect_redzone_yolo(frame, conf=REDZONE_YOLO_CONF, debug_frame=None):
     return confidence >= conf, bbox, confidence
 
 
+def load_green_banner_detector():
+    global _green_model, _green_model_available
+
+    if _green_model_available is False:
+        return None
+
+    if _green_model is None:
+        if not Path(GREEN_BANNER_MODEL_PATH).exists():
+            print(f"WARNING: green banner model missing: {GREEN_BANNER_MODEL_PATH}")
+            _green_model_available = False
+            return None
+
+        _green_model = YOLO(GREEN_BANNER_MODEL_PATH)
+        _green_model_available = True
+        print("Green banner model loaded")
+
+    return _green_model
+
+
+def detect_green_banner(frame):
+    model = load_green_banner_detector()
+    if model is None:
+        print("green banner detections count: 0")
+        return None
+
+    try:
+        results = model.predict(
+            source=frame,
+            conf=GREEN_BANNER_CONF,
+            imgsz=416,
+            device=0,
+            verbose=False,
+        )
+    except Exception as exc:
+        print(f"WARNING: green banner YOLO inference failed: {exc}")
+        print("green banner detections count: 0")
+        return None
+
+    boxes = results[0].boxes
+    detection_count = 0 if boxes is None else len(boxes)
+    print(f"green banner detections count: {detection_count}")
+    if boxes is None or len(boxes) == 0:
+        return None
+
+    best_box = max(boxes, key=lambda box: float(box.conf[0]))
+    confidence = float(best_box.conf[0])
+    if confidence <= GREEN_BANNER_CONF:
+        return None
+
+    x1, y1, x2, y2 = map(int, best_box.xyxy[0])
+    bbox = (x1, y1, x2, y2)
+    center = ((x1 + x2) // 2, (y1 + y2) // 2)
+    print(f"green banner bbox: {bbox}")
+    return {
+        "bbox": bbox,
+        "confidence": confidence,
+        "center": center,
+    }
+
+
 def clamp(value, min_value, max_value):
     return max(min_value, min(max_value, value))
 
@@ -273,6 +347,267 @@ def show_frame(frame, status):
     )
     cv2.imshow(WINDOW_NAME, frame)
     return cv2.waitKey(1) & 0xFF
+
+
+def draw_green_banner(frame, detection):
+    x1, y1, x2, y2 = detection["bbox"]
+    cx, cy = detection["center"]
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 220, 0), 2)
+    cv2.circle(frame, (cx, cy), 5, (0, 255, 0), -1)
+    cv2.putText(
+        frame,
+        f"GREEN {detection['confidence']:.2f}",
+        (x1, max(25, y1 - 10)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 220, 0),
+        2,
+    )
+
+
+def align_to_green_banner(controller, cap, corridor_name, current_waypoint=None):
+    detection_interval_s = 1.0 / GREEN_DETECT_FPS
+    search_started_at = time.time()
+    alignment_started_at = None
+    last_detection_at = 0.0
+    last_warning_at = 0.0
+    detection = None
+    last_banner_detection = None
+    corridor_title = corridor_name.capitalize()
+
+    print(f"Aligning with {corridor_name} corridor")
+    while True:
+        now = time.time()
+        if last_banner_detection is None and now - search_started_at >= GREEN_SEARCH_TIMEOUT:
+            controller.stop()
+            print("green banner detected False")
+            print("WARNING: green banner not detected before search timeout")
+            if ALLOW_CORRIDOR_WITHOUT_BANNER:
+                print("ALLOW_CORRIDOR_WITHOUT_BANNER=True, moving to corridor")
+                return "search_timeout_allowed"
+            return "search_timeout_blocked"
+
+        if (
+            alignment_started_at is not None
+            and now - alignment_started_at >= GREEN_ALIGN_TIMEOUT
+        ):
+            controller.stop()
+            print("Green banner detected but center alignment failed, continuing to corridor")
+            print("alignment timeout fallback")
+            print("alignment success False")
+            return "alignment_timeout_fallback"
+
+        frame = read_camera_frame(cap)
+        if frame is None:
+            if time.time() - last_warning_at >= 1.0:
+                print("Green banner frame unavailable, holding/searching")
+                last_warning_at = time.time()
+            controller.send_body_velocity_yaw_rate(0.0, 0.0, 0.0, GREEN_YAW_SPEED * 0.5)
+            time.sleep(LOOP_SLEEP_S)
+            continue
+
+        now = time.time()
+        if now - last_detection_at >= detection_interval_s:
+            detection = detect_green_banner(frame)
+            last_detection_at = now
+            if detection is not None:
+                last_banner_detection = detection
+                if alignment_started_at is None:
+                    alignment_started_at = now
+                    print(f"{corridor_title} green banner detected")
+                    print("green banner detected True")
+                    print(f"confidence: {detection['confidence']:.3f}")
+                    print(f"bbox: {detection['bbox']}")
+
+        current_alt = None
+        current_position = get_current_position(controller)
+        if current_position is not None:
+            current_alt = current_position.get("relative_alt")
+
+        active_detection = detection or last_banner_detection
+        if active_detection is None:
+            if now - last_warning_at >= 1.0:
+                print("Green banner not detected, holding/searching")
+                print(
+                    f"current waypoint: {current_waypoint}, "
+                    f"current altitude: {current_alt}"
+                )
+                last_warning_at = now
+            controller.send_body_velocity_yaw_rate(0.0, 0.0, 0.0, GREEN_YAW_SPEED)
+            key = show_frame(frame, f"{corridor_title} green banner search")
+            if key == ord("q"):
+                controller.stop()
+                print("green banner alignment failure: operator quit")
+                return "quit"
+            time.sleep(LOOP_SLEEP_S)
+            continue
+
+        draw_green_banner(frame, active_detection)
+        frame_height, frame_width = frame.shape[:2]
+        frame_center = (frame_width // 2, frame_height // 2)
+        banner_center = active_detection["center"]
+        error_x = banner_center[0] - frame_center[0]
+        error_y = banner_center[1] - frame_center[1]
+        print(f"frame center: {frame_center}")
+        print(f"banner center: {banner_center}")
+        print(f"error_x={error_x}, error_y={error_y}")
+
+        if (
+            abs(error_x) < GREEN_ALIGN_TOLERANCE_X
+            and abs(error_y) < GREEN_ALIGN_TOLERANCE_Y
+        ):
+            controller.stop()
+            print("commanded vx=0.000, vy=0.000, yaw=0.000")
+            print("alignment success True")
+            print(f"{corridor_title} corridor alignment complete")
+            return "aligned"
+
+        vx = clamp(
+            -GREEN_ALIGN_SPEED * (error_y / max(frame_height * 0.5, 1.0)),
+            -GREEN_ALIGN_SPEED,
+            GREEN_ALIGN_SPEED,
+        )
+        vy = clamp(
+            GREEN_ALIGN_SPEED * (error_x / max(frame_width * 0.5, 1.0)),
+            -GREEN_ALIGN_SPEED,
+            GREEN_ALIGN_SPEED,
+        )
+        yaw_rate = clamp(
+            GREEN_YAW_SPEED * (error_x / max(frame_width * 0.5, 1.0)),
+            -GREEN_YAW_SPEED,
+            GREEN_YAW_SPEED,
+        )
+        print(f"commanded vx={vx:.3f}, vy={vy:.3f}, yaw={yaw_rate:.3f}")
+        print(f"current waypoint: {current_waypoint}, current altitude: {current_alt}")
+        controller.send_body_velocity_yaw_rate(vx, vy, 0.0, yaw_rate)
+
+        key = show_frame(frame, f"{corridor_title} green banner align")
+        if key == ord("q"):
+            controller.stop()
+            print("green banner alignment failure: operator quit")
+            return "quit"
+
+        time.sleep(LOOP_SLEEP_S)
+
+
+def green_banner_result_allows_corridor(result):
+    return result in (
+        "aligned",
+        "alignment_timeout_fallback",
+        "search_timeout_allowed",
+    )
+
+
+def search_exit_green_banner_until_seen(controller, cap):
+    detection_interval_s = 1.0 / GREEN_DETECT_FPS
+    last_detection_at = 0.0
+    last_status_at = 0.0
+    detection = None
+
+    print("Searching exit green banner")
+    while True:
+        frame = read_camera_frame(cap)
+        if frame is None:
+            print("Exit green banner search frame unavailable")
+            time.sleep(LOOP_SLEEP_S)
+            continue
+
+        now = time.time()
+        if now - last_detection_at >= detection_interval_s:
+            detection = detect_green_banner(frame)
+            last_detection_at = now
+
+        if detection is not None:
+            draw_green_banner(frame, detection)
+            show_frame(frame, "Exit green banner detected")
+            controller.stop()
+            print("Exit green banner detected")
+            print("Exit green banner detected, proceeding to corridor")
+            print(f"exit banner confidence: {detection['confidence']:.3f}")
+            print(f"exit banner bbox: {detection['bbox']}")
+            return True
+
+        if now - last_status_at >= WAYPOINT_DEBUG_INTERVAL_S:
+            current_position = get_current_position(controller)
+            current_alt = current_position["alt"] if current_position is not None else None
+            print("current state: SEARCH_EXIT_GREEN_BANNER")
+            print("exit_banner_seen=False")
+            print(f"current altitude: {current_alt}")
+            last_status_at = now
+
+        controller.send_body_velocity_yaw_rate(0.0, 0.0, 0.0, GREEN_YAW_SPEED)
+        key = show_frame(frame, "Search exit green banner WP27")
+        if key == ord("q"):
+            controller.stop()
+            return False
+
+        time.sleep(LOOP_SLEEP_S)
+
+
+def move_exit_corridor_wp27_to_wp28(controller, cap, wp28, exit_banner_seen):
+    exit_wp28_command_sent = False
+    wp28_target = waypoint_with_altitude(wp28, CORRIDOR_ALTITUDE_M)
+    last_status_at = 0.0
+    last_frame_failed_at = 0.0
+
+    set_mission_state("MOVE_EXIT_CORRIDOR_WP27_TO_WP28")
+    controller.set_mode("GUIDED")
+    controller.set_cruise_speed(CORRIDOR_SPEED)
+    print("Moving WP27 to WP28")
+
+    while True:
+        if not exit_wp28_command_sent:
+            controller.goto_global_location(
+                wp28_target["lat"],
+                wp28_target["lon"],
+                CORRIDOR_ALTITUDE_M,
+            )
+            exit_wp28_command_sent = True
+            print("WP28 goto command sent")
+
+        current_position = get_current_position(controller)
+        distance_to_wp28 = None
+        current_alt = None
+        if current_position is not None:
+            distance_to_wp28 = distance_from_position_to_waypoint(
+                current_position,
+                wp28_target,
+            )
+            current_alt = current_position["alt"]
+
+        now = time.time()
+        if now - last_status_at >= WAYPOINT_DEBUG_INTERVAL_S:
+            distance_text = (
+                f"{distance_to_wp28:.2f}m"
+                if distance_to_wp28 is not None
+                else "None"
+            )
+            print("current state: MOVE_EXIT_CORRIDOR_WP27_TO_WP28")
+            print(f"exit_banner_seen={exit_banner_seen}")
+            print(f"exit_wp28_command_sent={exit_wp28_command_sent}")
+            print("target waypoint = 28")
+            print(f"distance_to_wp28={distance_text}")
+            print(f"current altitude: {current_alt}")
+            print(f"commanded altitude = {CORRIDOR_ALTITUDE_M:.1f}")
+            last_status_at = now
+
+        if distance_to_wp28 is not None and distance_to_wp28 <= WAYPOINT_ACCEPT_RADIUS:
+            controller.stop()
+            print("Reached WP28, switching RTL")
+            print("Reached WP28 exit corridor end")
+            return "reached"
+
+        frame = read_camera_frame(cap)
+        if frame is not None:
+            key = show_frame(frame, "Moving WP27 to WP28")
+            if key == ord("q"):
+                controller.stop()
+                return "quit"
+        elif now - last_frame_failed_at >= WAYPOINT_DEBUG_INTERVAL_S:
+            print("WP27 to WP28 camera frame unavailable; continuing waypoint movement")
+            last_frame_failed_at = now
+
+        time.sleep(LOOP_SLEEP_S)
 
 
 def draw_detection(frame, detection, label="QR"):
@@ -1507,6 +1842,7 @@ def run_surface_search(controller, cap, target_value, mission_items):
 def run_post_target_sequence(controller, cap, mission_items):
     set_mission_state("TARGET_QR_FOUND")
     controller.stop()
+    print("Target QR found")
     print("correct QR found")
     print("Correct QR detected, stopping lawn mower/search motion")
 
@@ -1546,62 +1882,43 @@ def run_post_target_sequence(controller, cap, mission_items):
         "Ascend after 5m hover",
     )
     if status != "reached":
-        print("ASCEND_AFTER_HOVER: position/altitude hold failed, continuing to WP16 at 10m")
+        print("ASCEND_AFTER_HOVER: position/altitude hold failed, continuing to WP27 at 10m")
 
-    set_mission_state("GOTO_EXIT_WP16")
-    print("going to WP16 first")
+    set_mission_state("MOVE_TO_EXIT_CORRIDOR_WP27")
+    print("Moving to exit corridor entrance WP27")
     status, _ = goto_waypoint_until_reached(
         controller,
         cap,
         waypoint_with_altitude(mission_items[EXIT_CORRIDOR_WP_SEQ], RETURN_ALT_M),
-        "Exit Corridor WP16 at 10m",
+        "Exit Corridor WP27 at 10m",
         watch_for_qr=False,
         arrival_tolerance_m=WAYPOINT_ACCEPT_RADIUS,
     )
     if status in ("quit", "camera_failed"):
         return status
-    print("reached WP16")
+    print("Reached exit corridor entrance WP27")
 
-    set_mission_state("DESCEND_AT_EXIT_WP16")
-    print("Exit corridor altitude active: descending to 2-3m at waypoint 16")
-    status, corridor_low_point = change_altitude_until_reached(
+    set_mission_state("SEARCH_EXIT_GREEN_BANNER")
+    exit_banner_seen = search_exit_green_banner_until_seen(controller, cap)
+    if not exit_banner_seen:
+        print("Exit green banner search ended before corridor move")
+        return "green_banner_failed"
+
+    print("Descending to corridor altitude")
+    print("Moving from WP27 to WP28")
+    status = move_exit_corridor_wp27_to_wp28(
         controller,
         cap,
-        EXIT_CORRIDOR_ALT_M,
-        "Exit Corridor WP16 descent to 3m",
+        mission_items[EXIT_CORRIDOR_END_WP_SEQ],
+        exit_banner_seen,
     )
     if status != "reached":
         return status
 
-    set_mission_state("MOVE_EXIT_WP16_TO_WP17")
-    print("moving WP16 to WP17")
-    print("Exit corridor altitude active: moving WP16 to WP17 at 2-3m")
-    status, _ = goto_waypoint_until_reached(
-        controller,
-        cap,
-        waypoint_with_altitude(mission_items[EXIT_CORRIDOR_END_WP_SEQ], EXIT_CORRIDOR_ALT_M),
-        "Exit Corridor WP17 at 3m",
-        watch_for_qr=False,
-        arrival_tolerance_m=WAYPOINT_ACCEPT_RADIUS,
-    )
-    if status in ("quit", "camera_failed"):
-        return status
-    print("Reached waypoint 17")
-
-    set_mission_state("ASCEND_AFTER_EXIT_WP17")
-    print("ascending after exit corridor")
-    status, _ = change_altitude_until_reached(
-        controller,
-        cap,
-        RETURN_ALT_M,
-        "Ascend after WP17",
-    )
-    if status != "reached":
-        return status
-
-    set_mission_state("RETURN_TO_HOME")
-    print("Waypoint 17 reached, switching to RTL")
+    set_mission_state("RTL_AFTER_EXIT")
+    print("Switching to RTL")
     controller.set_mode("RTL")
+    print("RTL command sent")
 
     print("Post-target mission sequence complete")
     return "rtl_started"
@@ -1656,24 +1973,66 @@ def main():
         status, _ = goto_waypoint_until_reached(
             controller,
             cap,
-            waypoint_with_altitude(mission_items[CORRIDOR_ENTRANCE_WP_SEQ], EXIT_CORRIDOR_ALT_M),
+            waypoint_with_altitude(mission_items[CORRIDOR_ENTRANCE_WP_SEQ], START_QR_ALT_M),
+            "WP3 Entrance Green Banner Approach",
+            arrival_tolerance_m=WAYPOINT_ACCEPT_RADIUS,
+        )
+        if status in ("quit", "camera_failed"):
+            return
+
+        set_mission_state("SEARCH_ENTRANCE_GREEN_BANNER")
+        print("Searching entrance green banner")
+        set_mission_state("ALIGN_ENTRANCE_GREEN_BANNER")
+        green_result = align_to_green_banner(
+            controller,
+            cap,
+            "entrance",
+            current_waypoint=f"WP{CORRIDOR_ENTRANCE_WP_SEQ}",
+        )
+        if not green_banner_result_allows_corridor(green_result):
+            print("Entrance green banner alignment failed, holding before corridor")
+            controller.stop()
+            return
+
+        set_mission_state("ENTER_ENTRANCE_CORRIDOR")
+        print("Descending to corridor altitude")
+        status, _ = change_altitude_until_reached(
+            controller,
+            cap,
+            CORRIDOR_ALTITUDE_M,
+            "WP3 descend to entrance corridor altitude",
+        )
+        if status in ("quit", "position_failed"):
+            return
+
+        print("Moving through entrance corridor WP3 to WP4")
+        controller.set_cruise_speed(CORRIDOR_SPEED)
+        print("moving to corridor")
+        print(f"current corridor waypoint: WP{CORRIDOR_ENTRANCE_WP_SEQ}")
+        status, _ = goto_waypoint_until_reached(
+            controller,
+            cap,
+            waypoint_with_altitude(mission_items[CORRIDOR_ENTRANCE_WP_SEQ], CORRIDOR_ALTITUDE_M),
             "WP3 Corridor Entrance",
             arrival_tolerance_m=WAYPOINT_ACCEPT_RADIUS,
         )
         if status in ("quit", "camera_failed"):
             return
 
+        print(f"current corridor waypoint: WP{SURFACE_ENTRANCE_WP_SEQ}")
         status, _ = goto_waypoint_until_reached(
             controller,
             cap,
-            waypoint_with_altitude(mission_items[SURFACE_ENTRANCE_WP_SEQ], EXIT_CORRIDOR_ALT_M),
+            waypoint_with_altitude(mission_items[SURFACE_ENTRANCE_WP_SEQ], CORRIDOR_ALTITUDE_M),
             "WP4 Surface Entrance",
             arrival_tolerance_m=WAYPOINT_ACCEPT_RADIUS,
         )
         if status in ("quit", "camera_failed"):
             return
 
-        set_mission_state("ASCEND_TO_SURFACE_ALTITUDE")
+        controller.set_cruise_speed(CRUISE_SPEED_MPS)
+        set_mission_state("ASCEND_AFTER_ENTRANCE_CORRIDOR")
+        print("Entrance corridor completed, ascending to 10m")
         status, _ = change_altitude_until_reached(
             controller,
             cap,

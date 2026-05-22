@@ -360,6 +360,27 @@ class GuidedController:
             0, 0
         )
 
+    def send_body_velocity_yaw_rate(self, vx, vy, vz=0.0, yaw_rate=0.0):
+        """
+        BODY_NED velocity plus yaw rate:
+        yaw_rate + = clockwise/right turn for ArduPilot body-frame command.
+        """
+        if vx == 0 and vy == 0 and vz == 0 and yaw_rate == 0:
+            caller = inspect.stack()[1].function
+            print(f"ZERO VELOCITY SENT BY: {caller}")
+
+        self.master.mav.set_position_target_local_ned_send(
+            int(time.time() * 1000) & 0xFFFFFFFF,
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_FRAME_BODY_NED,
+            0b0000011111000111,
+            0, 0, 0,
+            vx, vy, vz,
+            0, 0, 0,
+            0, yaw_rate
+        )
+
     def stop(self):
         self.send_body_velocity(0, 0, 0)
 
