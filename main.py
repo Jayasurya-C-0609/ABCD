@@ -1,5 +1,6 @@
 import math
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -9,6 +10,7 @@ from ultralytics import YOLO
 from config import (
     AUTO_PATH_END_WP_SEQ,
     AUTO_PATH_START_WP_SEQ,
+    CAMERA_BODY_MAPPING,
     CAMERA_POSITION_BODY,
     BYPASS_FORWARD_SPEED,
     BYPASS_SIDE_SPEED,
@@ -95,7 +97,37 @@ _green_model_available = None
 _solvepnp_qr_detector = cv2.QRCodeDetector()
 _camera_position_body = np.asarray(CAMERA_POSITION_BODY, dtype=np.float64)
 _payload_position_body = np.asarray(PAYLOAD_POSITION_BODY, dtype=np.float64)
-_r_body_camera = np.asarray(R_BODY_CAMERA, dtype=np.float64)
+_camera_body_rotations = {
+    "DOWNWARD_NORMAL": [
+        [0.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ],
+    "DOWNWARD_SWAP": [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ],
+    "DOWNWARD_INVERT_X": [
+        [0.0, -1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ],
+    "DOWNWARD_INVERT_Y": [
+        [0.0, 1.0, 0.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ],
+    "DOWNWARD_SWAP_AND_INVERT": [
+        [-1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ],
+}
+_r_body_camera = np.asarray(
+    _camera_body_rotations.get(CAMERA_BODY_MAPPING, R_BODY_CAMERA),
+    dtype=np.float64,
+)
 _qr_camera_matrix = np.asarray(QR_CAMERA_MATRIX, dtype=np.float64)
 _qr_dist_coeffs = np.asarray(QR_DIST_COEFFS, dtype=np.float64)
 _last_frame_time = None
@@ -1324,18 +1356,32 @@ def solvepnp_target_alignment(controller, cap, target_value):
     set_mission_state("SOLVEPNP_TARGET_ALIGNMENT")
     object_points = qr_object_points()
     consistent_aligned_frames = 0
+    solvepnp_success_frames = 0
+    error_window = deque(maxlen=5)
+    movement_active = True
+    print(f"solvePnP camera body mapping: {CAMERA_BODY_MAPPING}")
+
+    def stop_motion_once():
+        nonlocal movement_active
+        if movement_active:
+            controller.stop()
+            movement_active = False
 
     while True:
         frame = read_camera_frame(cap)
         if frame is None:
-            controller.stop()
+            solvepnp_success_frames = 0
+            error_window.clear()
+            stop_motion_once()
             time.sleep(LOOP_SLEEP_S)
             continue
 
         corners = qr_corners_from_frame(frame)
         if corners is None:
             consistent_aligned_frames = 0
-            controller.stop()
+            solvepnp_success_frames = 0
+            error_window.clear()
+            stop_motion_once()
             key = show_frame(frame, "solvePnP waiting for QR corners")
             if key == ord("q"):
                 return "quit"
@@ -1351,7 +1397,9 @@ def solvepnp_target_alignment(controller, cap, target_value):
         print(f"target matched {target_matched}")
         if not target_matched:
             consistent_aligned_frames = 0
-            controller.stop()
+            solvepnp_success_frames = 0
+            error_window.clear()
+            stop_motion_once()
             key = show_frame(frame, "solvePnP verifying target QR")
             if key == ord("q"):
                 return "quit"
@@ -1368,14 +1416,20 @@ def solvepnp_target_alignment(controller, cap, target_value):
         print(f"solvePnP success {solvepnp_success}")
         if not solvepnp_success:
             consistent_aligned_frames = 0
-            controller.stop()
+            solvepnp_success_frames = 0
+            error_window.clear()
+            stop_motion_once()
             time.sleep(0.1)
             continue
 
+        solvepnp_success_frames += 1
         qr_position_camera = tvec.reshape(3)
-        qr_position_body = _camera_position_body + (_r_body_camera @ qr_position_camera)
-        error_x_m = qr_position_body[0] - _payload_position_body[0]
-        error_y_m = qr_position_body[1] - _payload_position_body[1]
+        qr_position_body = (_r_body_camera @ qr_position_camera) + _camera_position_body
+        horizontal_error_x = qr_position_body[0] - _payload_position_body[0]
+        horizontal_error_y = qr_position_body[1] - _payload_position_body[1]
+        error_window.append((horizontal_error_x, horizontal_error_y))
+        error_x_m = sum(error[0] for error in error_window) / len(error_window)
+        error_y_m = sum(error[1] for error in error_window) / len(error_window)
         vx = clamp(
             SOLVEPNP_KP * error_x_m,
             -SOLVEPNP_MAX_SPEED,
@@ -1387,11 +1441,37 @@ def solvepnp_target_alignment(controller, cap, target_value):
             SOLVEPNP_MAX_SPEED,
         )
         current_alt, _ = get_current_altitude(controller)
+        corner_center = corners.mean(axis=0)
+        frame_height, frame_width = frame.shape[:2]
+        visual_error_x = corner_center[0] - (frame_width / 2.0)
+        visual_error_y = corner_center[1] - (frame_height / 2.0)
+        visually_near_center = (
+            abs(visual_error_x) <= PIXEL_ALIGN_TOL_X
+            and abs(visual_error_y) <= PIXEL_ALIGN_TOL_Y
+        )
         print(f"qr_position_camera={qr_position_camera.tolist()}")
         print(f"qr_position_body={qr_position_body.tolist()}")
         print(f"payload_position_body={_payload_position_body.tolist()}")
+        print(f"horizontal_error_x={horizontal_error_x:.3f}")
+        print(f"horizontal_error_y={horizontal_error_y:.3f}")
+        print(f"depth_z={qr_position_body[2]:.3f}")
         print(f"error_x_m={error_x_m:.3f}, error_y_m={error_y_m:.3f}")
         print(f"commanded vx={vx:.3f}, vy={vy:.3f}")
+        if abs(error_x_m) > 1.0 and visually_near_center:
+            print("solvePnP mapping likely wrong")
+
+        if solvepnp_success_frames < 3:
+            consistent_aligned_frames = 0
+            stop_motion_once()
+            print(
+                "solvePnP waiting for 3 consecutive success frames "
+                f"({solvepnp_success_frames}/3)"
+            )
+            key = show_frame(frame, "solvePnP stabilizing pose")
+            if key == ord("q"):
+                return "quit"
+            time.sleep(0.1)
+            continue
 
         altitude_ready = current_alt is not None and 4.8 <= current_alt <= 5.2
         errors_ready = (
@@ -1404,7 +1484,7 @@ def solvepnp_target_alignment(controller, cap, target_value):
             consistent_aligned_frames = 0
 
         if consistent_aligned_frames >= 3:
-            controller.stop()
+            stop_motion_once()
             set_mission_state("TARGET_ALIGNMENT_COMPLETE")
             print("solvePnP target alignment complete")
             print("alignment complete")
@@ -1412,8 +1492,9 @@ def solvepnp_target_alignment(controller, cap, target_value):
 
         for _ in range(2):
             controller.send_body_velocity(vx, vy, 0.0)
+            movement_active = True
             time.sleep(0.1)
-        controller.stop()
+        stop_motion_once()
         time.sleep(0.1)
 
         key = show_frame(frame, "solvePnP target alignment")
