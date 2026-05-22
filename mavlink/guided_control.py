@@ -10,6 +10,7 @@ class GuidedController:
         self._telemetry_lock = threading.Lock()
         self._telemetry_stop = threading.Event()
         self._telemetry_thread = None
+        self._last_zero_velocity_log = {}
         self._telemetry = {
             "GLOBAL_POSITION_INT": None,
             "LOCAL_POSITION_NED": None,
@@ -308,8 +309,7 @@ class GuidedController:
         vz - = up
         """
         if vx == 0 and vy == 0 and vz == 0:
-            caller = inspect.stack()[1].function
-            print(f"ZERO VELOCITY SENT BY: {caller}")
+            self._log_zero_velocity_sender()
 
         self.master.mav.set_position_target_local_ned_send(
             int(time.time() * 1000) & 0xFFFFFFFF,
@@ -329,8 +329,7 @@ class GuidedController:
         yaw_rate + = clockwise/right turn for ArduPilot body-frame command.
         """
         if vx == 0 and vy == 0 and vz == 0 and yaw_rate == 0:
-            caller = inspect.stack()[1].function
-            print(f"ZERO VELOCITY SENT BY: {caller}")
+            self._log_zero_velocity_sender()
 
         self.master.mav.set_position_target_local_ned_send(
             int(time.time() * 1000) & 0xFFFFFFFF,
@@ -346,6 +345,13 @@ class GuidedController:
 
     def stop(self):
         self.send_body_velocity(0, 0, 0)
+
+    def _log_zero_velocity_sender(self):
+        caller = inspect.stack()[2].function
+        now = time.time()
+        if now - self._last_zero_velocity_log.get(caller, 0.0) >= 1.0:
+            print(f"ZERO VELOCITY SENT BY: {caller}")
+            self._last_zero_velocity_log[caller] = now
 
     def hold(self, duration_s):
         end_time = time.time() + duration_s
