@@ -1,29 +1,24 @@
-# Drone Offboard QR Simulation with Mission Planner SITL
+# Drone Offboard QR Mission with Mission Planner SITL
 
-This is the first code version: **QR detection logic simulation**.
-It does not use a real camera. It simulates QR detection by checking whether the SITL drone is near pre-defined QR points.
+This project runs the Mission 2 QR search flow with Mission Planner SITL and a
+camera-backed vision pipeline.
 
 ## What this tests
 
 - MAVLink connection to Mission Planner SITL
 - GUIDED mode takeoff
-- 40 m x 30 m lawn-mower path
-- Simulated QR detection
-- Decode all detected QRs
-- Compare decoded value with target ID
-- If wrong QR: return to resume point and continue path
-- If target QR: go to target QR position and hover
+- Start QR detection and decoding at WP2
+- Entrance green banner detection before WP3 to WP4 corridor movement
+- Mission waypoint lawn-mower surface search
+- Red-zone coordinate and YOLO avoidance
+- Target QR payload hover flow
+- Exit green banner detection before WP27 to WP28 corridor movement
+- RTL after the exit corridor
 
 ## Install
 
 ```bash
-pip install pymavlink
-```
-
-Optional later for real vision:
-
-```bash
-pip install opencv-python opencv-contrib-python ultralytics numpy
+pip install pymavlink opencv-python opencv-contrib-python ultralytics numpy
 ```
 
 ## Mission Planner steps
@@ -41,23 +36,7 @@ cd drone_offboard_qr_sim
 python main.py
 ```
 
-## Change QR locations
-
-Edit `config.py`:
-
-```python
-SIMULATED_QR_POINTS = [
-    {"name": "WRONG_QR_1", "x": 8.0,  "y": 6.0,  "data": "DROP_B"},
-    {"name": "TARGET_QR",  "x": 33.0, "y": 24.0, "data": "DROP_A"},
-]
-```
-
-The target is:
-
-```python
-TARGET_ID = "DROP_A"
-```
-
 ## Important
 
-Mission Planner cannot place real QR images into the simulated camera view. This code uses position-based fake QR detection for SITL. Later, replace `SimulatedQRDetector` with `YOLOQRDetector` and replace `SimulatedQRDecoder` with `WeChatQRDecoder` for real camera/video testing.
+Upload the mission waypoints before running `main.py`, and keep the QR and
+green banner models in the `models` directory.

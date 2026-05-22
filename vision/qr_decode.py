@@ -27,12 +27,12 @@ def _clean_text(text):
 
 
 def _try_wechat(image):
-    res, points = wechat_detector.detectAndDecode(image)
+    res, _ = wechat_detector.detectAndDecode(image)
     return _clean_text(res)
 
 
 def _try_opencv(image):
-    text, points, _ = opencv_detector.detectAndDecode(image)
+    text, _, _ = opencv_detector.detectAndDecode(image)
     return _clean_text(text)
 
 

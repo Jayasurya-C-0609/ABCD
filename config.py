@@ -1,10 +1,4 @@
-"""
-Configuration for Mission Planner / ArduPilot SITL QR simulation.
-
-This project simulates QR detection using drone position instead of a real camera.
-When the simulated drone comes near a configured QR point, the offboard code
-acts as if YOLO detected the QR and WeChat decoded it.
-"""
+"""Configuration for the Mission Planner / ArduPilot Mission 2 QR flow."""
 
 # MAVLink connection for Mission Planner SITL.
 # Common values:
@@ -26,15 +20,11 @@ DROIDCAM_URL = ""
 # Flight settings
 TAKEOFF_ALT_M = 5.0
 START_QR_ALT_M = 5.0
-SEARCH_ALT_M = 10.0
 SURFACE_ALTITUDE_M = 10.0
 CRUISE_SPEED_MPS = 0.8
 SURFACE_SPEED_MPS = 1.0
-POSITION_TOLERANCE_M = 3.0
 PAYLOAD_DESCENT_ALT_M = 5.0
-PAYLOAD_ALTITUDE_M = 5.0
 PAYLOAD_HOVER_TIME_S = 7.0
-EXIT_CORRIDOR_ALT_M = 3.0
 CORRIDOR_ALTITUDE_M = 3.0
 CORRIDOR_SPEED = 0.4
 RETURN_ALT_M = 10.0
@@ -48,6 +38,34 @@ GREEN_YAW_SPEED = 0.15
 GREEN_DETECT_FPS = 5
 GREEN_SEARCH_TIMEOUT = 15
 ALLOW_CORRIDOR_WITHOUT_BANNER = True
+PIXEL_ALIGN_TOL_X = 100
+PIXEL_ALIGN_TOL_Y = 100
+PIXEL_ALIGN_TIMEOUT = 3.0
+PIXEL_ALIGN_SPEED = 0.20
+QR_REAL_SIZE_M = 1.0
+SOLVEPNP_KP = 0.35
+SOLVEPNP_MAX_SPEED = 0.25
+SOLVEPNP_ALIGN_TOLERANCE_M = 0.10
+
+# Replace these values with measured Mission 2 camera/payload calibration.
+CAMERA_POSITION_BODY = [0.0, 0.0, 0.0]
+PAYLOAD_POSITION_BODY = [0.0, 0.0, 0.0]
+
+# OpenCV camera frame: x right, y down, z forward.
+# Drone BODY_NED frame: x forward, y right, z down.
+R_BODY_CAMERA = [
+    [0.0, 0.0, 1.0],
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+]
+
+# Replace with calibrated intrinsics and distortion for the mission camera.
+QR_CAMERA_MATRIX = [
+    [600.0, 0.0, 320.0],
+    [0.0, 600.0, 240.0],
+    [0.0, 0.0, 1.0],
+]
+QR_DIST_COEFFS = [0.0, 0.0, 0.0, 0.0, 0.0]
 REDZONE_VISUAL_MIN_AREA_RATIO = 0.08
 REDZONE_VISUAL_CENTER_MARGIN_RATIO = 0.35
 SAFETY_MARGIN = 0.5
@@ -76,33 +94,3 @@ REDZONE_POLYGON_LATLON = [
     (-35.3637695412708, 149.165273532271),
 ]
 
-# 40 x 30 m delivery surface in local coordinates.
-# x axis = 40 m side, y axis = 30 m side.
-AREA_LENGTH_M = 40.0
-AREA_WIDTH_M = 30.0
-LANE_SPACING_M = 5.0
-
-# Simulated QR behavior
-QR_DETECTION_RADIUS_M = 2.2      # Drone "detects" QR when closer than this
-QR_ALIGN_TIME_S = 2.0            # Simulated hover/align time
-QR_ALREADY_SEEN_RADIUS_M = 1.5   # Prevent repeated detection of same QR
-
-# Start QR gives this target ID.
-# In real mission, this comes from the QR near start point.
-TARGET_ID = "DROP_A"
-
-# Simulated QR locations inside the 40x30m surface.
-# In real camera flight, YOLO+WeChat replaces this.
-SIMULATED_QR_POINTS = [
-    {"name": "WRONG_QR_1", "x": 8.0,  "y": 6.0,  "data": "DROP_B"},
-    {"name": "WRONG_QR_2", "x": 21.0, "y": 16.0, "data": "DROP_C"},
-    {"name": "TARGET_QR",  "x": 33.0, "y": 24.0, "data": "DROP_A"},
-]
-
-# Mission Planner/SITL home is used as origin. The code converts local meters to GPS.
-# Use NED-like convention:
-#   local x = East meters
-#   local y = North meters
-# If your rectangle direction is different, change these signs or rotate coordinates later.
-LOCAL_X_IS_EAST = True
-LOCAL_Y_IS_NORTH = True

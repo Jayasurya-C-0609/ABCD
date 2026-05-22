@@ -1,5 +1,4 @@
 import time
-import math
 import inspect
 import threading
 from pymavlink import mavutil
@@ -257,27 +256,6 @@ class GuidedController:
     def get_global_position(self, timeout_s=1.0):
         return self.get_cached_message("GLOBAL_POSITION_INT")
 
-    def distance_to_global_location(self, lat, lon, alt_m):
-        position = self.get_global_position(timeout_s=0.02)
-
-        if position is None:
-            return None
-
-        earth_radius_m = 6371000.0
-        lat1 = math.radians(position["lat"])
-        lat2 = math.radians(lat)
-        dlat = math.radians(lat - position["lat"])
-        dlon = math.radians(lon - position["lon"])
-
-        a = (
-            math.sin(dlat / 2) ** 2
-            + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-        )
-        ground_distance = earth_radius_m * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-        altitude_error = alt_m - position["relative_alt"]
-
-        return math.sqrt(ground_distance ** 2 + altitude_error ** 2)
-
     def goto_global_location(self, lat, lon, alt_m):
         self.master.mav.set_position_target_global_int_send(
             int(time.time() * 1000) & 0xFFFFFFFF,
@@ -299,21 +277,6 @@ class GuidedController:
             return None
 
         return position["north"], position["east"], position["down"]
-
-    def distance_to_local_position(self, north_m, east_m, alt_m):
-        position = self.get_local_position(timeout_s=0.02)
-
-        if position is None:
-            return None
-
-        current_north, current_east, current_down = position
-        target_down = -alt_m
-
-        return math.sqrt(
-            (north_m - current_north) ** 2
-            + (east_m - current_east) ** 2
-            + (target_down - current_down) ** 2
-        )
 
     def goto_local_position(self, north_m, east_m, alt_m):
         """
