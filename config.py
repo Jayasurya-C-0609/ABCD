@@ -43,8 +43,8 @@ PIXEL_ALIGN_TOL_Y = 100
 PIXEL_ALIGN_TIMEOUT = 3.0
 PIXEL_ALIGN_SPEED = 0.20
 QR_REAL_SIZE_M = 1.0
-SOLVEPNP_KP = 0.35
-SOLVEPNP_MAX_SPEED = 0.25
+SOLVEPNP_KP = 0.25
+SOLVEPNP_MAX_SPEED = 0.15
 SOLVEPNP_ALIGN_TOLERANCE_M = 0.10
 
 # Replace these values with measured Mission 2 camera/payload calibration.
@@ -53,10 +53,15 @@ PAYLOAD_POSITION_BODY = [0.0, 0.0, 0.0]
 
 # OpenCV camera frame: x right, y down, z forward.
 # Drone BODY_NED frame: x forward, y right, z down.
+# For the initial downward-facing-camera test:
+#   body_x = camera_y, body_y = camera_x, body_z = camera_z.
+# Modes: DOWNWARD_NORMAL, DOWNWARD_SWAP, DOWNWARD_INVERT_X,
+# DOWNWARD_INVERT_Y, DOWNWARD_SWAP_AND_INVERT.
+CAMERA_BODY_MAPPING = "DOWNWARD_NORMAL"
 R_BODY_CAMERA = [
-    [0.0, 0.0, 1.0],
-    [1.0, 0.0, 0.0],
     [0.0, 1.0, 0.0],
+    [1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0],
 ]
 
 # Replace with calibrated intrinsics and distortion for the mission camera.
