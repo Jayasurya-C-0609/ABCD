@@ -1,17 +1,13 @@
 import math
 import time
-from collections import deque
 from pathlib import Path
 
 import cv2
-import numpy as np
 from ultralytics import YOLO
 
 from config import (
     AUTO_PATH_END_WP_SEQ,
     AUTO_PATH_START_WP_SEQ,
-    CAMERA_BODY_MAPPING,
-    CAMERA_POSITION_BODY,
     BYPASS_FORWARD_SPEED,
     BYPASS_SIDE_SPEED,
     BYPASS_TURN_HOVER,
@@ -36,16 +32,8 @@ from config import (
     GREEN_YAW_SPEED,
     PAYLOAD_DESCENT_ALT_M,
     PAYLOAD_HOVER_TIME_S,
-    PAYLOAD_POSITION_BODY,
-    PIXEL_ALIGN_SPEED,
-    PIXEL_ALIGN_TIMEOUT,
-    PIXEL_ALIGN_TOL_X,
-    PIXEL_ALIGN_TOL_Y,
+    POSITION_TOLERANCE_M,
     QR_MODEL_PATH,
-    QR_CAMERA_MATRIX,
-    QR_DIST_COEFFS,
-    QR_REAL_SIZE_M,
-    R_BODY_CAMERA,
     RED_MODEL_PATH,
     REDZONE_POLYGON_LATLON,
     REDZONE_BYPASS_MARGIN_M,
@@ -57,9 +45,6 @@ from config import (
     RETURN_ALT_M,
     START_QR_ALT_M,
     START_QR_WP_SEQ,
-    SOLVEPNP_ALIGN_TOLERANCE_M,
-    SOLVEPNP_KP,
-    SOLVEPNP_MAX_SPEED,
     SURFACE_ALTITUDE_M,
     SURFACE_SPEED_MPS,
     SURFACE_ENTRANCE_WP_SEQ,
@@ -70,9 +55,11 @@ from mavlink.guided_control import GuidedController
 from vision.camera import open_camera
 
 
+DECODE_ATTEMPTS = 5
 WAYPOINT_TIMEOUT = 25
 WAYPOINT_TIMEOUT_S = WAYPOINT_TIMEOUT
 WAYPOINT_ACCEPT_RADIUS = 1.0
+START_QR_TIMEOUT_S = 45
 START_QR_SCAN_TIMEOUT = 60
 START_QR_MAX_RETRIES = 3
 QR_DETECT_FPS = 5
@@ -94,42 +81,6 @@ _red_model = None
 _red_model_available = None
 _green_model = None
 _green_model_available = None
-_solvepnp_qr_detector = cv2.QRCodeDetector()
-_camera_position_body = np.asarray(CAMERA_POSITION_BODY, dtype=np.float64)
-_payload_position_body = np.asarray(PAYLOAD_POSITION_BODY, dtype=np.float64)
-_camera_body_rotations = {
-    "DOWNWARD_NORMAL": [
-        [0.0, 1.0, 0.0],
-        [1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0],
-    ],
-    "DOWNWARD_SWAP": [
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0],
-    ],
-    "DOWNWARD_INVERT_X": [
-        [0.0, -1.0, 0.0],
-        [1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0],
-    ],
-    "DOWNWARD_INVERT_Y": [
-        [0.0, 1.0, 0.0],
-        [-1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0],
-    ],
-    "DOWNWARD_SWAP_AND_INVERT": [
-        [-1.0, 0.0, 0.0],
-        [0.0, -1.0, 0.0],
-        [0.0, 0.0, 1.0],
-    ],
-}
-_r_body_camera = np.asarray(
-    _camera_body_rotations.get(CAMERA_BODY_MAPPING, R_BODY_CAMERA),
-    dtype=np.float64,
-)
-_qr_camera_matrix = np.asarray(QR_CAMERA_MATRIX, dtype=np.float64)
-_qr_dist_coeffs = np.asarray(QR_DIST_COEFFS, dtype=np.float64)
 _last_frame_time = None
 _display_fps = 0.0
 _home_lat = None
@@ -1224,283 +1175,43 @@ def perform_redzone_visual_backup_avoid(controller, cap):
     controller.stop()
 
 
-def select_best_qr_detection(detections):
-    if not detections:
-        return None
-    return max(detections, key=lambda detection: detection.get("confidence", 0.0))
+def align_and_decode_qr(controller, cap, reason):
+    print(f"{reason}: QR detected, stopping and decoding without center alignment")
+    controller.stop()
 
-
-def pixel_align_and_decode_qr(controller, cap, reason, target_value):
-    set_mission_state("QR_PIXEL_DETECT_AND_DECODE")
-    print(f"{reason}: QR detected, starting rough pixel alignment")
-    started_at = time.time()
-    decode_attempt = 0
-    pixel_success_logged = False
-
-    while time.time() - started_at < PIXEL_ALIGN_TIMEOUT:
+    for attempt in range(1, DECODE_ATTEMPTS + 1):
         frame = read_camera_frame(cap)
         if frame is None:
             return None
 
         detections = detect_qrs(frame)
-        print(f"QR detections count: {len(detections)}")
         if not detections:
-            key = show_frame(frame, f"{reason}: pixel QR search")
+            print(f"{reason}: no QR visible on decode attempt {attempt}")
+            key = show_frame(frame, f"{reason}: waiting for QR")
             if key == ord("q"):
                 return None
-            time.sleep(LOOP_SLEEP_S)
+            time.sleep(0.2)
             continue
 
-        detection = select_best_qr_detection(detections)
-        bbox = detection["bbox"]
-        x1, y1, x2, y2 = bbox
-        frame_height, frame_width = frame.shape[:2]
-        qr_center = ((x1 + x2) // 2, (y1 + y2) // 2)
-        frame_center = (frame_width // 2, frame_height // 2)
-        error_x = qr_center[0] - frame_center[0]
-        error_y = qr_center[1] - frame_center[1]
-        print(f"selected QR bbox: {bbox}")
-        print(f"pixel error_x={error_x}, error_y={error_y}")
-        draw_detection(frame, detection, "QR pixel")
+        print(f"{reason}: decode attempt {attempt}, QR detections = {len(detections)}")
 
-        decode_attempt += 1
-        decoded_text, processed = decode_qr_crop(frame, bbox)
-        if processed is not None:
-            cv2.imshow("Processed QR", processed)
-        print(f"decoded QR text: {decoded_text}")
+        for index, detection in enumerate(detections, start=1):
+            draw_detection(frame, detection, f"QR {index}")
+            decoded_text, processed = decode_qr_crop(frame, detection["bbox"])
 
-        if decoded_text:
-            decoded_text = decoded_text.strip()
-            target_matched = target_text_matches(decoded_text, target_value)
-            print(f"target matched {target_matched}")
-            controller.stop()
-            show_frame(frame, f"{reason}: decoded {decoded_text}")
-            if target_matched:
-                set_mission_state("TARGET_QR_CONFIRMED")
-                print("Target QR decoded, switching to solvePnP alignment")
-                print("switching to solvePnP")
-            else:
-                print("QR decoded but not target, resuming path")
-                set_mission_state("NORMAL_LAWN_MOWER")
-            return decoded_text
+            if processed is not None:
+                cv2.imshow("Processed QR", processed)
 
-        if (
-            abs(error_x) <= PIXEL_ALIGN_TOL_X
-            and abs(error_y) <= PIXEL_ALIGN_TOL_Y
-        ):
-            if not pixel_success_logged:
-                print("pixel alignment success")
-                pixel_success_logged = True
-            controller.stop()
-        else:
-            vx = clamp(
-                -PIXEL_ALIGN_SPEED * (error_y / max(frame_height * 0.5, 1.0)),
-                -PIXEL_ALIGN_SPEED,
-                PIXEL_ALIGN_SPEED,
-            )
-            vy = clamp(
-                PIXEL_ALIGN_SPEED * (error_x / max(frame_width * 0.5, 1.0)),
-                -PIXEL_ALIGN_SPEED,
-                PIXEL_ALIGN_SPEED,
-            )
-            print(f"pixel commanded vx={vx:.3f}, vy={vy:.3f}")
-            controller.send_body_velocity(vx, vy, 0.0)
+            print(f"{reason}: QR {index} decoded = {decoded_text}")
+            if decoded_text:
+                show_frame(frame, f"{reason}: decoded {decoded_text}")
+                return decoded_text.strip()
 
-        key = show_frame(frame, f"{reason}: QR pixel decode {decode_attempt}")
-        if key == ord("q"):
-            controller.stop()
-            return None
-        time.sleep(LOOP_SLEEP_S)
+        show_frame(frame, f"{reason}: decode attempt {attempt}")
+        time.sleep(0.3)
 
-    controller.stop()
-    print("pixel alignment timeout")
-    set_mission_state("NORMAL_LAWN_MOWER")
+    print(f"{reason}: QR detected but value not decoded")
     return None
-
-
-def qr_corners_from_frame(frame):
-    found, points = _solvepnp_qr_detector.detect(frame)
-    corners = None
-    if found and points is not None and len(points) > 0:
-        corners = np.ascontiguousarray(points.reshape(-1, 2)[:4], dtype=np.float64)
-    print(f"QR corners found {corners is not None}")
-    return corners
-
-
-def bbox_from_qr_corners(corners, frame):
-    frame_height, frame_width = frame.shape[:2]
-    x_values = corners[:, 0]
-    y_values = corners[:, 1]
-    return (
-        int(clamp(np.floor(x_values.min()), 0, frame_width - 1)),
-        int(clamp(np.floor(y_values.min()), 0, frame_height - 1)),
-        int(clamp(np.ceil(x_values.max()), 0, frame_width - 1)),
-        int(clamp(np.ceil(y_values.max()), 0, frame_height - 1)),
-    )
-
-
-def qr_object_points():
-    half_size = QR_REAL_SIZE_M / 2.0
-    return np.ascontiguousarray(
-        [
-            [-half_size, -half_size, 0.0],
-            [half_size, -half_size, 0.0],
-            [half_size, half_size, 0.0],
-            [-half_size, half_size, 0.0],
-        ],
-        dtype=np.float64,
-    )
-
-
-def solvepnp_target_alignment(controller, cap, target_value):
-    set_mission_state("SOLVEPNP_TARGET_ALIGNMENT")
-    object_points = qr_object_points()
-    consistent_aligned_frames = 0
-    solvepnp_success_frames = 0
-    error_window = deque(maxlen=5)
-    movement_active = True
-    print(f"solvePnP camera body mapping: {CAMERA_BODY_MAPPING}")
-
-    def stop_motion_once():
-        nonlocal movement_active
-        if movement_active:
-            controller.stop()
-            movement_active = False
-
-    while True:
-        frame = read_camera_frame(cap)
-        if frame is None:
-            solvepnp_success_frames = 0
-            error_window.clear()
-            stop_motion_once()
-            time.sleep(LOOP_SLEEP_S)
-            continue
-
-        corners = qr_corners_from_frame(frame)
-        if corners is None:
-            consistent_aligned_frames = 0
-            solvepnp_success_frames = 0
-            error_window.clear()
-            stop_motion_once()
-            key = show_frame(frame, "solvePnP waiting for QR corners")
-            if key == ord("q"):
-                return "quit"
-            time.sleep(0.1)
-            continue
-
-        bbox = bbox_from_qr_corners(corners, frame)
-        decoded_text, processed = decode_qr_crop(frame, bbox)
-        if processed is not None:
-            cv2.imshow("Processed QR", processed)
-        print(f"decoded QR text: {decoded_text}")
-        target_matched = target_text_matches(decoded_text, target_value)
-        print(f"target matched {target_matched}")
-        if not target_matched:
-            consistent_aligned_frames = 0
-            solvepnp_success_frames = 0
-            error_window.clear()
-            stop_motion_once()
-            key = show_frame(frame, "solvePnP verifying target QR")
-            if key == ord("q"):
-                return "quit"
-            time.sleep(0.1)
-            continue
-
-        solvepnp_success, _, tvec = cv2.solvePnP(
-            object_points,
-            corners,
-            _qr_camera_matrix,
-            _qr_dist_coeffs,
-            flags=cv2.SOLVEPNP_ITERATIVE,
-        )
-        print(f"solvePnP success {solvepnp_success}")
-        if not solvepnp_success:
-            consistent_aligned_frames = 0
-            solvepnp_success_frames = 0
-            error_window.clear()
-            stop_motion_once()
-            time.sleep(0.1)
-            continue
-
-        solvepnp_success_frames += 1
-        qr_position_camera = tvec.reshape(3)
-        qr_position_body = (_r_body_camera @ qr_position_camera) + _camera_position_body
-        horizontal_error_x = qr_position_body[0] - _payload_position_body[0]
-        horizontal_error_y = qr_position_body[1] - _payload_position_body[1]
-        error_window.append((horizontal_error_x, horizontal_error_y))
-        error_x_m = sum(error[0] for error in error_window) / len(error_window)
-        error_y_m = sum(error[1] for error in error_window) / len(error_window)
-        vx = clamp(
-            SOLVEPNP_KP * error_x_m,
-            -SOLVEPNP_MAX_SPEED,
-            SOLVEPNP_MAX_SPEED,
-        )
-        vy = clamp(
-            SOLVEPNP_KP * error_y_m,
-            -SOLVEPNP_MAX_SPEED,
-            SOLVEPNP_MAX_SPEED,
-        )
-        current_alt, _ = get_current_altitude(controller)
-        corner_center = corners.mean(axis=0)
-        frame_height, frame_width = frame.shape[:2]
-        visual_error_x = corner_center[0] - (frame_width / 2.0)
-        visual_error_y = corner_center[1] - (frame_height / 2.0)
-        visually_near_center = (
-            abs(visual_error_x) <= PIXEL_ALIGN_TOL_X
-            and abs(visual_error_y) <= PIXEL_ALIGN_TOL_Y
-        )
-        print(f"qr_position_camera={qr_position_camera.tolist()}")
-        print(f"qr_position_body={qr_position_body.tolist()}")
-        print(f"payload_position_body={_payload_position_body.tolist()}")
-        print(f"horizontal_error_x={horizontal_error_x:.3f}")
-        print(f"horizontal_error_y={horizontal_error_y:.3f}")
-        print(f"depth_z={qr_position_body[2]:.3f}")
-        print(f"error_x_m={error_x_m:.3f}, error_y_m={error_y_m:.3f}")
-        print(f"commanded vx={vx:.3f}, vy={vy:.3f}")
-        if abs(error_x_m) > 1.0 and visually_near_center:
-            print("solvePnP mapping likely wrong")
-
-        if solvepnp_success_frames < 3:
-            consistent_aligned_frames = 0
-            stop_motion_once()
-            print(
-                "solvePnP waiting for 3 consecutive success frames "
-                f"({solvepnp_success_frames}/3)"
-            )
-            key = show_frame(frame, "solvePnP stabilizing pose")
-            if key == ord("q"):
-                return "quit"
-            time.sleep(0.1)
-            continue
-
-        altitude_ready = current_alt is not None and 4.8 <= current_alt <= 5.2
-        errors_ready = (
-            abs(error_x_m) < SOLVEPNP_ALIGN_TOLERANCE_M
-            and abs(error_y_m) < SOLVEPNP_ALIGN_TOLERANCE_M
-        )
-        if errors_ready and altitude_ready:
-            consistent_aligned_frames += 1
-        else:
-            consistent_aligned_frames = 0
-
-        if consistent_aligned_frames >= 3:
-            stop_motion_once()
-            set_mission_state("TARGET_ALIGNMENT_COMPLETE")
-            print("solvePnP target alignment complete")
-            print("alignment complete")
-            return "reached"
-
-        for _ in range(2):
-            controller.send_body_velocity(vx, vy, 0.0)
-            movement_active = True
-            time.sleep(0.1)
-        stop_motion_once()
-        time.sleep(0.1)
-
-        key = show_frame(frame, "solvePnP target alignment")
-        if key == ord("q"):
-            controller.stop()
-            return "quit"
 
 
 def hover_with_camera(controller, cap, hover_time_s, label, hold_waypoint=None):
@@ -1523,6 +1234,35 @@ def hover_with_camera(controller, cap, hover_time_s, label, hold_waypoint=None):
         time.sleep(0.2)
 
     return "done"
+
+
+def get_latest_global_position(controller, timeout_s=0.2):
+    position = controller.get_global_position(timeout_s=0.0)
+    if position is None:
+        return None
+
+    return cache_position({
+        "type": "global",
+        "source": "GLOBAL_POSITION_INT",
+        "lat": position["lat"],
+        "lon": position["lon"],
+        "alt": position["relative_alt"],
+    })
+
+
+def get_latest_gps_raw_position(controller, timeout_s=0.2):
+    msg = controller.get_cached_message("GPS_RAW_INT")
+    if msg is None or msg["lat"] == 0 or msg["lon"] == 0:
+        return None
+
+    altitude = _last_valid_position["alt"] if _last_valid_position is not None else 0.0
+    return cache_position({
+        "type": "global",
+        "source": "GPS_RAW_INT",
+        "lat": msg["lat"],
+        "lon": msg["lon"],
+        "alt": altitude,
+    })
 
 
 def local_position_to_global(north, east, down):
@@ -1591,6 +1331,10 @@ def get_safe_position(controller):
     return None
 
 
+def get_safe_current_position(controller):
+    return get_safe_position(controller)
+
+
 def command_position_hold(controller, position):
     position_type = position.get("type", "global" if "lat" in position and "lon" in position else "local")
     if position_type == "global":
@@ -1619,7 +1363,7 @@ def get_current_altitude(controller):
 
 
 def change_altitude_at_current_xy(controller, cap, target_alt_m, label):
-    current_position = get_safe_position(controller)
+    current_position = get_safe_current_position(controller)
     if current_position is None:
         return "position_failed", None
 
@@ -1743,12 +1487,9 @@ def goto_waypoint(
                 draw_detection(frame, detection, "QR")
 
         if watch_for_qr and detections:
-            decoded_text = pixel_align_and_decode_qr(
-                controller,
-                cap,
-                label,
-                target_value,
-            )
+            controller.stop()
+            time.sleep(0.6)
+            decoded_text = align_and_decode_qr(controller, cap, label)
 
             if decoded_text is None:
                 print(f"{label}: could not decode, resuming path")
@@ -2098,14 +1839,14 @@ def run_surface_search(controller, cap, target_value, mission_items):
     return None
 
 
-def run_post_target_sequence(controller, cap, mission_items, target_value):
-    set_mission_state("TARGET_QR_CONFIRMED")
+def run_post_target_sequence(controller, cap, mission_items):
+    set_mission_state("TARGET_QR_FOUND")
     controller.stop()
     print("Target QR found")
     print("correct QR found")
     print("Correct QR detected, stopping lawn mower/search motion")
 
-    set_mission_state("DESCEND_FOR_PAYLOAD")
+    set_mission_state("DESCEND_TO_5M")
     print("Descending to 5m")
     status, payload_point = change_altitude_until_reached(
         controller,
@@ -2119,15 +1860,6 @@ def run_post_target_sequence(controller, cap, mission_items, target_value):
             "continuing directly to exit corridor entrance"
         )
         payload_point = None
-
-    if payload_point is not None:
-        solvepnp_status = solvepnp_target_alignment(controller, cap, target_value)
-        if solvepnp_status != "reached":
-            print(f"solvePnP target alignment ended with status: {solvepnp_status}")
-            return solvepnp_status
-        aligned_payload_point = get_current_position(controller)
-        if aligned_payload_point is not None:
-            payload_point = aligned_payload_point
 
     if payload_point is not None:
         set_mission_state("HOVER_AFTER_DECODE")
@@ -2314,7 +2046,7 @@ def main():
 
         if found_value:
             print(f"TARGET FOUND: {found_value}")
-            post_status = run_post_target_sequence(controller, cap, mission_items, target_value)
+            post_status = run_post_target_sequence(controller, cap, mission_items)
             rtl_started = post_status == "rtl_started"
 
             if post_status not in ("complete", "rtl_started"):
